@@ -89,12 +89,22 @@ export interface AnalyticsSummary {
   riskSpotlights: RiskSpotlight[];
 }
 
+export interface GovernanceSummary {
+  ontologyVersion: string;
+  policyVersion: string;
+  privacyMode: string;
+  curatedQuerySources: string[];
+  sensitiveFieldGroups: Record<string, string[]>;
+  graphProfiles: Record<string, string>;
+}
+
 export interface GraphPayload {
   nodes: GraphNode[];
   edges: GraphEdge[];
   stats: GraphStats;
   examplePrompts: string[];
   analytics: AnalyticsSummary;
+  governance: GovernanceSummary;
 }
 
 export interface NodeDetailsPayload {
@@ -138,6 +148,7 @@ export interface QueryResponse {
   engine: "guardrail" | "rule" | "gemini";
   reason?: string;
   planSteps: string[];
+  guardrailNotes: string[];
   suggestions: string[];
 }
 

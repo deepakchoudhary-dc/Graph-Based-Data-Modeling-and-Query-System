@@ -11,6 +11,8 @@ An evaluator-ready graph-based data modeling and query system for the provided S
 - Deterministic fast-path rules for high-value document-flow questions
 - Streaming query UX with visible plan, SQL, row preview, and grounded final answer
 - Analytics layer with process-health metrics, anomaly spotlights, top products, and top customers
+- Policy-driven privacy guardrails with curated-source enforcement, exfiltration blocking, and sensitive-field redaction
+- Model-provider abstraction so the LLM layer can evolve without rewriting graph or safety logic
 - Dataset verification script for key evaluator questions
 - AI session log artifact for submission packaging
 
@@ -41,6 +43,19 @@ Raw JSONL datasets are loaded into base tables and then shaped into curated busi
 - `v_document_links`
 
 These views are intentionally business-oriented so the LLM does not need to rediscover fragile joins at runtime.
+
+### 2.1 Governance Layer
+
+The graph and query engine now include a governance layer with:
+
+- ontology versioning
+- curated query-source allowlists
+- privacy-sensitive field groups
+- node governance profiles
+- bulk-extraction defenses
+- redaction-aware result sanitization
+
+This keeps the system durable even if the underlying LLM provider changes later.
 
 ### 3. Graph Model
 
@@ -99,7 +114,12 @@ Guardrails operate at multiple layers:
 
 - Domain keyword and business-ID checks
 - Off-topic rejection for irrelevant prompts
+- Bulk extraction and dataset-dump rejection
 - SQL validation blocking non-read operations
+- Curated-view allowlists
+- `SELECT *` blocking
+- policy-based row caps
+- sensitive-field redaction in privacy-sensitive queries
 - Curated-view-first prompting
 - Result-grounded answer generation only after execution
 
@@ -154,6 +174,7 @@ Example rejection:
 Create `.env` from `.env.example` and add your Gemini key:
 
 ```env
+LLM_PROVIDER=gemini
 GEMINI_API_KEY=put-your-api-key-here
 GEMINI_MODEL=gemini-2.5-flash
 PORT=4000

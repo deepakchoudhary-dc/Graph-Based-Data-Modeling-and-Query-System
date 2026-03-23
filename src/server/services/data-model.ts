@@ -21,6 +21,12 @@ import {
   toDisplayValue,
   titleFromKey
 } from "../utils/jsonl.js";
+import {
+  GOVERNANCE_SUMMARY,
+  maskSensitiveValue,
+  NODE_GOVERNANCE,
+  SENSITIVE_COLUMNS
+} from "./governance.js";
 
 type Row = Record<string, unknown>;
 type RawDatasets = Record<string, Row[]>;
@@ -135,7 +141,8 @@ export async function buildDataModel(rootDirectory: string): Promise<DataModel> 
       edges: graphContext.initialEdges,
       stats: graphContext.stats,
       examplePrompts: EXAMPLE_PROMPTS,
-      analytics
+      analytics,
+      governance: GOVERNANCE_SUMMARY
     },
     allNodes: graphContext.allNodes,
     allEdges: graphContext.allEdges,
@@ -1233,6 +1240,16 @@ function buildGraph(raw: RawDatasets) {
     }
   }
 
+  for (const [nodeId, node] of allNodes.entries()) {
+    const profile = NODE_GOVERNANCE[node.kind];
+    const connectionCount = (adjacency.get(nodeId) ?? new Set()).size;
+    node.metadata.graphClassification = profile.classification;
+    node.metadata.graphDescription = profile.description;
+    node.metadata.graphSourceDatasets = profile.sourceDatasets.join(", ");
+    node.metadata.graphOntologyVersion = GOVERNANCE_SUMMARY.ontologyVersion;
+    node.metadata.connectionCount = connectionCount;
+  }
+
   const initialNodes = Array.from(allNodes.values()).filter((node) => node.initial);
   const initialEdges = Array.from(allEdges.values()).filter((edge) => edge.initial);
   const stats: GraphStats = {
@@ -1276,11 +1293,18 @@ export function getNodeDetails(model: DataModel, nodeId: string) {
   return {
     node: {
       ...node,
+      metadata: sanitizeMetadataRecord(node.metadata),
       expandable: expansionNodes.length > 0
     },
-    neighbors,
+    neighbors: neighbors.map((neighbor) => ({
+      ...neighbor,
+      metadata: sanitizeMetadataRecord(neighbor.metadata)
+    })),
     expansion: {
-      nodes: expansionNodes,
+      nodes: expansionNodes.map((candidate) => ({
+        ...candidate,
+        metadata: sanitizeMetadataRecord(candidate.metadata)
+      })),
       edges: expansionEdges
     }
   };
@@ -1490,6 +1514,17 @@ function countNodeKinds(nodes: Map<string, GraphNode>): Record<string, number> {
     counts[node.kind] = (counts[node.kind] ?? 0) + 1;
   }
   return counts;
+}
+
+function sanitizeMetadataRecord(
+  metadata: Record<string, JsonValue>
+): Record<string, JsonValue> {
+  return Object.fromEntries(
+    Object.entries(metadata).map(([key, value]) => [
+      key,
+      SENSITIVE_COLUMNS.has(key) ? maskSensitiveValue(key, value) : value
+    ])
+  );
 }
 
 function indexBy(rows: Row[], field: string): Map<string, Row> {

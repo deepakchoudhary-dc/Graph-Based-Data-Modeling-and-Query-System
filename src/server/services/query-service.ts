@@ -9,14 +9,16 @@ import {
   collectTraceHighlight,
   type DataModel
 } from "./data-model.js";
-import { GeminiClient } from "./gemini-client.js";
+import { createDefaultLlmProvider } from "./llm-provider.js";
 import {
   ensureLimit,
   evaluateQuestionDomain,
   extractKnownIds,
+  sanitizeQueryResult,
   validateReadOnlySql
 } from "./guardrails.js";
 import { escapeSqlLiteral } from "../utils/jsonl.js";
+import { GOVERNANCE_SUMMARY } from "./governance.js";
 
 type QueryRows = Array<Record<string, JsonValue>>;
 
@@ -35,7 +37,7 @@ type GeminiPlan = {
   reason?: string;
 };
 
-const geminiClient = new GeminiClient();
+const llmProvider = createDefaultLlmProvider();
 
 export async function streamAnswerQuestion(
   model: DataModel,
@@ -48,11 +50,11 @@ export async function streamAnswerQuestion(
     payload: "Validating the question against dataset guardrails."
   });
 
-  const domainCheck = evaluateQuestionDomain(question, model);
-  if (!domainCheck.allowed) {
+  const policy = evaluateQuestionDomain(question, model);
+  if (!policy.allowed) {
     const rejected: QueryResponse = {
       rejected: true,
-      answer: domainCheck.reason ?? "This system is designed for dataset questions only.",
+      answer: policy.reason ?? "This system is designed for dataset questions only.",
       sql: null,
       columns: [],
       rows: [],
@@ -60,10 +62,11 @@ export async function streamAnswerQuestion(
       focus: null,
       intent: "guardrail",
       engine: "guardrail",
-      reason: domainCheck.reason,
+      reason: policy.reason,
       planSteps: [
         "Rejected the prompt because it falls outside the dataset domain guardrails."
       ],
+      guardrailNotes: policy.notes,
       suggestions: model.examplePrompts
     };
     emit({ type: "answer", payload: rejected.answer });
@@ -82,19 +85,21 @@ export async function streamAnswerQuestion(
       } as unknown as JsonValue
     });
     const executed = executeSql(model.db, rulePlan.sql);
+    const sanitized = sanitizeQueryResult(executed.columns, executed.rows, policy);
     const highlights =
-      rulePlan.highlights?.(executed.rows) ?? inferHighlights(executed.rows, model);
+      rulePlan.highlights?.(sanitized.rows) ?? inferHighlights(sanitized.rows, model);
     const response: QueryResponse = {
       rejected: false,
-      answer: rulePlan.answer(executed.rows),
+      answer: rulePlan.answer(sanitized.rows),
       sql: executed.sql,
-      columns: executed.columns,
-      rows: executed.rows,
+      columns: sanitized.columns,
+      rows: sanitized.rows,
       highlights,
       focus: buildFocus(model, highlights, question),
       intent: rulePlan.intent,
       engine: "rule",
-      planSteps: rulePlan.planSteps,
+      planSteps: [...rulePlan.planSteps, ...sanitized.notes],
+      guardrailNotes: [...policy.notes, ...sanitized.notes],
       suggestions: nextSuggestions(model, question)
     };
     emit({ type: "sql", payload: executed.sql });
@@ -110,7 +115,7 @@ export async function streamAnswerQuestion(
     return response;
   }
 
-  if (!geminiClient.isConfigured()) {
+  if (!llmProvider.isConfigured()) {
     const rejected: QueryResponse = {
       rejected: true,
       answer:
@@ -126,6 +131,7 @@ export async function streamAnswerQuestion(
         "No deterministic rule matched the question.",
         "A Gemini API key is required for open-ended SQL generation."
       ],
+      guardrailNotes: policy.notes,
       suggestions: model.examplePrompts
     };
     emit({ type: "answer", payload: rejected.answer });
@@ -153,6 +159,7 @@ export async function streamAnswerQuestion(
       engine: "guardrail",
       reason: plan.reason,
       planSteps: ["Gemini classified the prompt as out of domain and rejected it."],
+      guardrailNotes: policy.notes,
       suggestions: model.examplePrompts
     };
     emit({ type: "answer", payload: rejected.answer });
@@ -161,26 +168,27 @@ export async function streamAnswerQuestion(
   }
 
   const executed = executeSql(model.db, plan.sql);
+  const sanitized = sanitizeQueryResult(executed.columns, executed.rows, policy);
   emit({ type: "sql", payload: executed.sql });
   emit({
     type: "rows",
     payload: {
-      count: executed.rows.length,
-      preview: executed.rows.slice(0, 5)
+      count: sanitized.rows.length,
+      preview: sanitized.rows.slice(0, 5)
     } as unknown as JsonValue
   });
   emit({
     type: "status",
     payload: "Summarizing the SQL result into a grounded natural-language answer."
   });
-  const answer = await summarizeWithGemini(question, executed.sql, executed.rows);
-  const highlights = inferHighlights(executed.rows, model);
+  const answer = await summarizeWithGemini(question, executed.sql, sanitized.rows);
+  const highlights = inferHighlights(sanitized.rows, model);
   const response: QueryResponse = {
     rejected: false,
     answer,
     sql: executed.sql,
-    columns: executed.columns,
-    rows: executed.rows,
+    columns: sanitized.columns,
+    rows: sanitized.rows,
     highlights,
     focus: buildFocus(model, highlights, question),
     intent: plan.intent || "gemini-sql",
@@ -188,8 +196,10 @@ export async function streamAnswerQuestion(
     planSteps: [
       "Validated the question against dataset guardrails.",
       "Generated read-only SQL against curated business views.",
-      "Executed the SQL and summarized only the returned rows."
+      "Executed the SQL and summarized only the returned rows.",
+      ...sanitized.notes
     ],
+    guardrailNotes: [...policy.notes, ...sanitized.notes],
     suggestions: nextSuggestions(model, question)
   };
   emit({ type: "answer", payload: response.answer });
@@ -202,11 +212,11 @@ export async function answerQuestion(
   question: string,
   conversation: ChatMessage[]
 ): Promise<QueryResponse> {
-  const domainCheck = evaluateQuestionDomain(question, model);
-  if (!domainCheck.allowed) {
+  const policy = evaluateQuestionDomain(question, model);
+  if (!policy.allowed) {
     return {
       rejected: true,
-      answer: domainCheck.reason ?? "This system is designed for dataset questions only.",
+      answer: policy.reason ?? "This system is designed for dataset questions only.",
       sql: null,
       columns: [],
       rows: [],
@@ -214,8 +224,9 @@ export async function answerQuestion(
       focus: null,
       intent: "guardrail",
       engine: "guardrail",
-      reason: domainCheck.reason,
+      reason: policy.reason,
       planSteps: ["Rejected the prompt because it falls outside the dataset domain guardrails."],
+      guardrailNotes: policy.notes,
       suggestions: model.examplePrompts
     };
   }
@@ -223,24 +234,26 @@ export async function answerQuestion(
   const rulePlan = planRuleQuestion(question, model);
   if (rulePlan) {
     const executed = executeSql(model.db, rulePlan.sql);
+    const sanitized = sanitizeQueryResult(executed.columns, executed.rows, policy);
     const highlights =
-      rulePlan.highlights?.(executed.rows) ?? inferHighlights(executed.rows, model);
+      rulePlan.highlights?.(sanitized.rows) ?? inferHighlights(sanitized.rows, model);
     return {
       rejected: false,
-      answer: rulePlan.answer(executed.rows),
+      answer: rulePlan.answer(sanitized.rows),
       sql: executed.sql,
-      columns: executed.columns,
-      rows: executed.rows,
+      columns: sanitized.columns,
+      rows: sanitized.rows,
       highlights,
       focus: buildFocus(model, highlights, question),
       intent: rulePlan.intent,
       engine: "rule",
-      planSteps: rulePlan.planSteps,
+      planSteps: [...rulePlan.planSteps, ...sanitized.notes],
+      guardrailNotes: [...policy.notes, ...sanitized.notes],
       suggestions: nextSuggestions(model, question)
     };
   }
 
-  if (!geminiClient.isConfigured()) {
+  if (!llmProvider.isConfigured()) {
     return {
       rejected: true,
       answer:
@@ -256,6 +269,7 @@ export async function answerQuestion(
         "No deterministic rule matched the question.",
         "A Gemini API key is required for open-ended SQL generation."
       ],
+      guardrailNotes: policy.notes,
       suggestions: model.examplePrompts
     };
   }
@@ -277,19 +291,21 @@ export async function answerQuestion(
         engine: "guardrail",
         reason: plan.reason,
         planSteps: ["Gemini classified the prompt as out of domain and rejected it."],
+        guardrailNotes: policy.notes,
         suggestions: model.examplePrompts
       };
     }
 
     const executed = executeSql(model.db, plan.sql);
-    const answer = await summarizeWithGemini(question, executed.sql, executed.rows);
-    const highlights = inferHighlights(executed.rows, model);
+    const sanitized = sanitizeQueryResult(executed.columns, executed.rows, policy);
+    const answer = await summarizeWithGemini(question, executed.sql, sanitized.rows);
+    const highlights = inferHighlights(sanitized.rows, model);
     return {
       rejected: false,
       answer,
       sql: executed.sql,
-      columns: executed.columns,
-      rows: executed.rows,
+      columns: sanitized.columns,
+      rows: sanitized.rows,
       highlights,
       focus: buildFocus(model, highlights, question),
       intent: plan.intent || "gemini-sql",
@@ -297,8 +313,10 @@ export async function answerQuestion(
       planSteps: [
         "Validated the question against dataset guardrails.",
         "Generated read-only SQL against curated business views.",
-        "Executed the SQL and summarized only the returned rows."
+        "Executed the SQL and summarized only the returned rows.",
+        ...sanitized.notes
       ],
+      guardrailNotes: [...policy.notes, ...sanitized.notes],
       suggestions: nextSuggestions(model, question)
     };
   } catch (error) {
@@ -316,6 +334,7 @@ export async function answerQuestion(
       engine: "guardrail",
       reason,
       planSteps: ["Query planning failed before a safe answer could be returned."],
+      guardrailNotes: policy.notes,
       suggestions: model.examplePrompts
     };
   }
@@ -560,9 +579,11 @@ async function generateGeminiPlan(
     "You are planning a dataset-backed SQL query for an Order-to-Cash analytics system.",
     "Only answer questions grounded in the provided dataset schema.",
     "Reject requests that are off-topic, creative, or general knowledge.",
-    "Use only read-only SQLite SQL.",
-    "Prefer these views when possible: v_sales_flow, v_billing_flow, v_product_billing_stats, v_flow_anomalies, v_customer_master, v_product_master.",
+    `Use only read-only SQLite SQL against these curated sources: ${GOVERNANCE_SUMMARY.curatedQuerySources.join(", ")}.`,
+    "Never use raw base tables.",
+    "Never use SELECT *.",
     "Always add a LIMIT of 50 or less.",
+    "Avoid selecting address or contact fields unless they are essential, and prefer aggregate answers over bulk extraction.",
     "",
     "Return strict JSON with this shape:",
     '{"decision":"answer|reject","intent":"short-intent","sql":"SELECT ...","reason":"optional"}',
@@ -579,8 +600,8 @@ async function generateGeminiPlan(
     `Current question: ${question}`
   ].join("\n");
 
-  const plan = await geminiClient.generateJson<GeminiPlan>(prompt);
-  const validation = validateReadOnlySql(plan.sql ?? "");
+  const plan = await llmProvider.generateJson<GeminiPlan>(prompt);
+  const validation = validateReadOnlySql(plan.sql ?? "", { maxRows: 50 });
   if (plan.decision === "answer" && !validation.valid) {
     throw new Error(validation.reason ?? "Generated SQL failed validation.");
   }
@@ -604,7 +625,7 @@ async function summarizeWithGemini(
     `Rows: ${JSON.stringify(rows.slice(0, 25))}`
   ].join("\n");
 
-  return geminiClient.generateText(prompt);
+  return llmProvider.generateText(prompt);
 }
 
 function executeSql(db: Database, sql: string): {
@@ -613,7 +634,7 @@ function executeSql(db: Database, sql: string): {
   rows: QueryRows;
 } {
   const normalized = ensureLimit(sql);
-  const validation = validateReadOnlySql(normalized);
+  const validation = validateReadOnlySql(normalized, { maxRows: 50 });
   if (!validation.valid) {
     throw new Error(validation.reason ?? "SQL validation failed.");
   }
