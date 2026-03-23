@@ -1,0 +1,33 @@
+node_modules
+dist
+.env
+.env.*
+.DS_Store
+
+# Data and dataset files (do NOT commit)
+/data/
+**/data/
+*.jsonl
+*.zip
+unzip/
+
+# Images and media
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+
+# Private keys and certs
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Databases
+*.sqlite
+*.db
+
+# Secrets files
+secrets.txt
+*.secret
