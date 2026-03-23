@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ForceGraph2D from "react-force-graph-2d";
 import type { GraphPayload } from "@shared/types";
 
@@ -8,6 +8,7 @@ type GraphCanvasProps = {
   highlightedNodeIds: string[];
   focusedEdgeIds: string[];
   onSelectNode: (nodeId: string) => void;
+  onBackgroundClick: () => void;
   onClearHighlights: () => void;
 };
 
@@ -27,9 +28,11 @@ export function GraphCanvas({
   highlightedNodeIds,
   focusedEdgeIds,
   onSelectNode,
+  onBackgroundClick,
   onClearHighlights
 }: GraphCanvasProps) {
   const graphRef = useRef<any>(null);
+  const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const highlightedSet = useMemo(
     () => new Set(highlightedNodeIds),
     [highlightedNodeIds]
@@ -43,9 +46,30 @@ export function GraphCanvas({
     return () => window.clearTimeout(handle);
   }, [graph.nodes.length, graph.edges.length]);
 
+  useEffect(() => {
+    const graphInstance = graphRef.current;
+    if (!graphInstance) {
+      return;
+    }
+
+    const chargeForce = graphInstance.d3Force("charge");
+    if (chargeForce?.strength) {
+      chargeForce.strength(-150);
+    }
+
+    const linkForce = graphInstance.d3Force("link");
+    if (linkForce?.distance) {
+      linkForce.distance((link: RenderLink) =>
+        focusedEdgeSet.has(link.id) ? 105 : 72
+      );
+    }
+
+    graphInstance.d3ReheatSimulation?.();
+  }, [focusedEdgeSet, graph.nodes.length, graph.edges.length]);
+
   const graphData = useMemo(
     () => ({
-      nodes: graph.nodes,
+      nodes: seedClusterLayout(graph.nodes),
       links: graph.edges
     }),
     [graph]
@@ -92,7 +116,8 @@ export function GraphCanvas({
             context,
             globalScale,
             selectedNodeId,
-            highlightedSet
+            highlightedSet,
+            hoveredNodeId
           );
         }}
         nodePointerAreaPaint={(node, color, context) => {
@@ -102,6 +127,12 @@ export function GraphCanvas({
           context.fill();
         }}
         onNodeClick={(node) => onSelectNode((node as RenderNode).id)}
+        onNodeHover={(node) =>
+          setHoveredNodeId(node ? (node as RenderNode).id : null)
+        }
+        onBackgroundClick={onBackgroundClick}
+        onEngineStop={() => graphRef.current?.zoomToFit(500, 80)}
+        enablePointerInteraction
         cooldownTicks={120}
         d3VelocityDecay={0.25}
         enableNodeDrag
@@ -115,33 +146,80 @@ function drawNode(
   context: CanvasRenderingContext2D,
   globalScale: number,
   selectedNodeId: string | null,
-  highlightedSet: Set<string>
+  highlightedSet: Set<string>,
+  hoveredNodeId: string | null
 ) {
   const isSelected = node.id === selectedNodeId;
   const isHighlighted = highlightedSet.has(node.id);
-  const radius = node.size + (isSelected ? 4 : isHighlighted ? 2.5 : 0);
-  const fontSize = Math.max(10 / globalScale, 3.6);
+  const isHovered = hoveredNodeId === node.id;
+  const radius =
+    node.size + (isSelected ? 4 : isHighlighted ? 2.5 : isHovered ? 1.5 : 0);
+  const fontSize = Math.max(10 / globalScale, 4.2);
 
   context.beginPath();
   context.arc(node.x ?? 0, node.y ?? 0, radius, 0, 2 * Math.PI, false);
   context.fillStyle = node.color;
   context.fill();
 
-  if (isSelected || isHighlighted) {
-    context.lineWidth = isSelected ? 2.5 : 1.8;
-    context.strokeStyle = isSelected ? "#111827" : "#f59e0b";
+  if (isSelected || isHighlighted || isHovered) {
+    context.lineWidth = isSelected ? 2.5 : isHighlighted ? 1.8 : 1.2;
+    context.strokeStyle = isSelected
+      ? "#111827"
+      : isHighlighted
+        ? "#f59e0b"
+        : "rgba(15, 23, 42, 0.55)";
     context.stroke();
   }
 
-  if (isSelected || isHighlighted || radius >= 7) {
+  const showLabel =
+    isSelected ||
+    isHighlighted ||
+    isHovered ||
+    (globalScale > 2.1 && radius >= 7.5);
+
+  if (showLabel) {
     context.font = `600 ${fontSize}px Aptos, "Segoe UI", sans-serif`;
     context.fillStyle = "#0f172a";
     context.textAlign = "left";
     context.textBaseline = "middle";
-    context.fillText(node.label, (node.x ?? 0) + radius + 4, node.y ?? 0);
+    const text = node.label.length > 34 ? `${node.label.slice(0, 34)}...` : node.label;
+    context.fillText(text, (node.x ?? 0) + radius + 5, node.y ?? 0);
   }
 }
 
 function getNodeId(value: string | RenderNode): string {
   return typeof value === "string" ? value : value.id;
+}
+
+function seedClusterLayout(nodes: GraphPayload["nodes"]): RenderNode[] {
+  const groups = new Map<string, GraphPayload["nodes"]>();
+  for (const node of nodes) {
+    const list = groups.get(node.kind) ?? [];
+    list.push(node);
+    groups.set(node.kind, list);
+  }
+
+  const kinds = Array.from(groups.keys()).sort();
+  const orbitRadiusX = 430;
+  const orbitRadiusY = 250;
+  const positioned = new Map<string, RenderNode>();
+
+  kinds.forEach((kind, kindIndex) => {
+    const group = groups.get(kind) ?? [];
+    const clusterAngle = (Math.PI * 2 * kindIndex) / Math.max(kinds.length, 1);
+    const clusterX = Math.cos(clusterAngle) * orbitRadiusX;
+    const clusterY = Math.sin(clusterAngle) * orbitRadiusY;
+
+    group.forEach((node, itemIndex) => {
+      const localAngle = itemIndex * 0.62 + kindIndex * 0.28;
+      const localRadius = 18 + Math.sqrt(itemIndex + 1) * 16;
+      positioned.set(node.id, {
+        ...node,
+        x: clusterX + Math.cos(localAngle) * localRadius,
+        y: clusterY + Math.sin(localAngle) * localRadius * 0.82
+      });
+    });
+  });
+
+  return nodes.map((node) => positioned.get(node.id) ?? node);
 }

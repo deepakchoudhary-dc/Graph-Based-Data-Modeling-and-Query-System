@@ -185,6 +185,11 @@ export function App() {
     });
   };
 
+  const handleClearInspector = () => {
+    setSelectedNodeId(null);
+    setSelectedDetails(null);
+  };
+
   const handleAskQuestion = async (question: string) => {
     if (!question.trim() || loadingQuery) {
       return;
@@ -319,6 +324,7 @@ export function App() {
                   highlightedNodeIds={highlights}
                   focusedEdgeIds={focusedEdgeIds}
                   onSelectNode={handleSelectNode}
+                  onBackgroundClick={handleClearInspector}
                   onClearHighlights={() => {
                     setHighlights([]);
                     setFocusedEdgeIds([]);
@@ -327,6 +333,7 @@ export function App() {
                 <NodeInspector
                   details={selectedDetails}
                   onExpand={handleExpandNode}
+                  onClose={handleClearInspector}
                 />
               </>
             ) : null}

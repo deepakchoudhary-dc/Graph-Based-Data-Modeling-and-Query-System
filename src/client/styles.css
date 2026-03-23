@@ -301,6 +301,7 @@ textarea {
 
 .toolbar-button,
 .expand-button,
+.close-button,
 .composer button,
 .suggestion-pill {
   border: none;
@@ -310,7 +311,8 @@ textarea {
 }
 
 .toolbar-button,
-.expand-button {
+.expand-button,
+.close-button {
   padding: 10px 14px;
   background: rgba(255, 255, 255, 0.92);
   color: #0f172a;
@@ -324,9 +326,14 @@ textarea {
 
 .toolbar-button:hover,
 .expand-button:hover,
+.close-button:hover,
 .composer button:hover,
 .suggestion-pill:hover {
   transform: translateY(-1px);
+}
+
+.close-button {
+  background: rgba(15, 23, 42, 0.08);
 }
 
 .node-inspector {
@@ -349,9 +356,21 @@ textarea {
   gap: 16px;
 }
 
+.inspector-actions {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
 .inspector-summary {
-  margin: 10px 0 14px;
+  margin: 10px 0 8px;
   color: #334155;
+}
+
+.inspector-hint {
+  margin: 0 0 14px;
+  color: #64748b;
+  font-size: 0.82rem;
 }
 
 .inspector-stats {

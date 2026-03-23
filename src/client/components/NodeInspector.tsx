@@ -3,9 +3,14 @@ import type { NodeDetailsPayload } from "@shared/types";
 type NodeInspectorProps = {
   details: NodeDetailsPayload | null;
   onExpand: () => void;
+  onClose: () => void;
 };
 
-export function NodeInspector({ details, onExpand }: NodeInspectorProps) {
+export function NodeInspector({
+  details,
+  onExpand,
+  onClose
+}: NodeInspectorProps) {
   if (!details) {
     return null;
   }
@@ -19,14 +24,22 @@ export function NodeInspector({ details, onExpand }: NodeInspectorProps) {
           <p className="eyebrow">{details.node.kind}</p>
           <h3>{details.node.label}</h3>
         </div>
-        {details.expansion.nodes.length > 0 && (
-          <button type="button" className="expand-button" onClick={onExpand}>
-            Expand Node
+        <div className="inspector-actions">
+          {details.expansion.nodes.length > 0 && (
+            <button type="button" className="expand-button" onClick={onExpand}>
+              Expand Node
+            </button>
+          )}
+          <button type="button" className="close-button" onClick={onClose}>
+            Close
           </button>
-        )}
+        </div>
       </div>
 
       <p className="inspector-summary">{details.node.summary}</p>
+      <p className="inspector-hint">
+        Click empty graph space to dismiss this panel.
+      </p>
 
       <div className="inspector-stats">
         <span>{details.neighbors.length} neighbors</span>
