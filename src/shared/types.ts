@@ -55,11 +55,46 @@ export interface GraphStats {
   nodeKinds: Record<string, number>;
 }
 
+export interface MetricCard {
+  label: string;
+  value: number | string;
+  tone: "neutral" | "good" | "warning" | "accent";
+  detail: string;
+}
+
+export interface BreakdownItem {
+  label: string;
+  count: number;
+}
+
+export interface RankedEntity {
+  id: string;
+  label: string;
+  primaryMetric: number;
+  secondaryMetric?: number;
+}
+
+export interface RiskSpotlight {
+  title: string;
+  detail: string;
+  nodeIds: string[];
+}
+
+export interface AnalyticsSummary {
+  metricCards: MetricCard[];
+  flowBreakdown: BreakdownItem[];
+  anomalyBreakdown: BreakdownItem[];
+  topProducts: RankedEntity[];
+  topCustomers: RankedEntity[];
+  riskSpotlights: RiskSpotlight[];
+}
+
 export interface GraphPayload {
   nodes: GraphNode[];
   edges: GraphEdge[];
   stats: GraphStats;
   examplePrompts: string[];
+  analytics: AnalyticsSummary;
 }
 
 export interface NodeDetailsPayload {
@@ -71,9 +106,24 @@ export interface NodeDetailsPayload {
   };
 }
 
+export interface SearchResult {
+  nodeId: string;
+  label: string;
+  kind: NodeKind;
+  summary: string;
+  score: number;
+  reason: string;
+}
+
 export interface QueryRequest {
   question: string;
   conversation: ChatMessage[];
+}
+
+export interface QueryFocus {
+  title: string;
+  nodes: string[];
+  edges: string[];
 }
 
 export interface QueryResponse {
@@ -83,13 +133,27 @@ export interface QueryResponse {
   columns: string[];
   rows: Array<Record<string, JsonValue>>;
   highlights: string[];
+  focus: QueryFocus | null;
   intent: string;
   engine: "guardrail" | "rule" | "gemini";
   reason?: string;
+  planSteps: string[];
   suggestions: string[];
 }
 
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
+}
+
+export interface QueryStreamEvent {
+  type:
+    | "status"
+    | "plan"
+    | "sql"
+    | "rows"
+    | "answer"
+    | "done"
+    | "error";
+  payload: JsonValue;
 }

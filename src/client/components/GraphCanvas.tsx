@@ -6,6 +6,7 @@ type GraphCanvasProps = {
   graph: GraphPayload;
   selectedNodeId: string | null;
   highlightedNodeIds: string[];
+  focusedEdgeIds: string[];
   onSelectNode: (nodeId: string) => void;
   onClearHighlights: () => void;
 };
@@ -24,6 +25,7 @@ export function GraphCanvas({
   graph,
   selectedNodeId,
   highlightedNodeIds,
+  focusedEdgeIds,
   onSelectNode,
   onClearHighlights
 }: GraphCanvasProps) {
@@ -32,6 +34,7 @@ export function GraphCanvas({
     () => new Set(highlightedNodeIds),
     [highlightedNodeIds]
   );
+  const focusedEdgeSet = useMemo(() => new Set(focusedEdgeIds), [focusedEdgeIds]);
 
   useEffect(() => {
     const handle = window.setTimeout(() => {
@@ -70,12 +73,18 @@ export function GraphCanvas({
       <ForceGraph2D
         ref={graphRef}
         graphData={graphData}
-        linkColor={(link) => (link as RenderLink).color}
+        linkColor={(link) =>
+          focusedEdgeSet.has((link as RenderLink).id)
+            ? "rgba(217, 72, 95, 0.95)"
+            : (link as RenderLink).color
+        }
         linkWidth={(link) =>
-          highlightedSet.has(getNodeId((link as RenderLink).source)) ||
-          highlightedSet.has(getNodeId((link as RenderLink).target))
-            ? 2
-            : 1
+          focusedEdgeSet.has((link as RenderLink).id)
+            ? 3
+            : highlightedSet.has(getNodeId((link as RenderLink).source)) ||
+                highlightedSet.has(getNodeId((link as RenderLink).target))
+              ? 2
+              : 1
         }
         nodeCanvasObject={(node, context, globalScale) => {
           drawNode(

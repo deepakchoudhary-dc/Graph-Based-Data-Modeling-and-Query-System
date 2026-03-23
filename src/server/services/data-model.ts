@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import initSqlJs, { type Database } from "sql.js";
 import {
+  type AnalyticsSummary,
   type GraphEdge,
   type GraphNode,
   type GraphPayload,
@@ -9,6 +10,7 @@ import {
   type JsonValue,
   type NodeKind
 } from "../../shared/types.js";
+import type { SearchResult } from "../../shared/types.js";
 import {
   asIntegerKey,
   asNullableString,
@@ -124,6 +126,7 @@ export async function buildDataModel(rootDirectory: string): Promise<DataModel> 
   const raw = loadRawDatasets(dataDirectory);
   const db = await buildDatabase(raw);
   const graphContext = buildGraph(raw);
+  const analytics = buildAnalyticsSummary(db, graphContext.lookup);
 
   return {
     db,
@@ -131,7 +134,8 @@ export async function buildDataModel(rootDirectory: string): Promise<DataModel> 
       nodes: graphContext.initialNodes,
       edges: graphContext.initialEdges,
       stats: graphContext.stats,
-      examplePrompts: EXAMPLE_PROMPTS
+      examplePrompts: EXAMPLE_PROMPTS,
+      analytics
     },
     allNodes: graphContext.allNodes,
     allEdges: graphContext.allEdges,
@@ -423,6 +427,85 @@ function createAnalyticsViews(db: Database): void {
   `);
 
   db.run(`
+    CREATE VIEW v_customer_revenue_stats AS
+    SELECT
+      customer_id,
+      customer_name,
+      COUNT(DISTINCT billing_document) AS billing_document_count,
+      ROUND(SUM(CAST(billing_item_net_amount AS REAL)), 2) AS total_billed_amount,
+      COUNT(DISTINCT CASE
+        WHEN payment_document IS NULL
+         AND journal_reference_document IS NOT NULL
+         AND CAST(COALESCE(billing_cancelled, '0') AS INTEGER) = 0
+        THEN billing_document
+      END) AS open_billing_documents
+    FROM v_sales_flow
+    WHERE billing_document IS NOT NULL
+    GROUP BY customer_id, customer_name;
+  `);
+
+  db.run(`
+    CREATE VIEW v_document_links AS
+    SELECT DISTINCT
+      'customer' AS source_kind,
+      customer_id AS source_id,
+      'sales-order' AS target_kind,
+      sales_order AS target_id,
+      'placed-order' AS relation
+    FROM v_sales_flow
+    WHERE customer_id IS NOT NULL
+      AND sales_order IS NOT NULL
+
+    UNION ALL
+
+    SELECT DISTINCT
+      'sales-order',
+      sales_order,
+      'delivery',
+      delivery_document,
+      'fulfilled-by'
+    FROM v_sales_flow
+    WHERE sales_order IS NOT NULL
+      AND delivery_document IS NOT NULL
+
+    UNION ALL
+
+    SELECT DISTINCT
+      'delivery',
+      delivery_document,
+      'billing-document',
+      billing_document,
+      'billed-by'
+    FROM v_sales_flow
+    WHERE delivery_document IS NOT NULL
+      AND billing_document IS NOT NULL
+
+    UNION ALL
+
+    SELECT DISTINCT
+      'billing-document',
+      billing_document,
+      'journal-entry',
+      accounting_document,
+      'posted-to'
+    FROM v_sales_flow
+    WHERE billing_document IS NOT NULL
+      AND journal_reference_document IS NOT NULL
+
+    UNION ALL
+
+    SELECT DISTINCT
+      'journal-entry',
+      accounting_document,
+      'payment',
+      payment_document,
+      'cleared-by'
+    FROM v_sales_flow
+    WHERE journal_reference_document IS NOT NULL
+      AND payment_document IS NOT NULL;
+  `);
+
+  db.run(`
     CREATE VIEW v_flow_anomalies AS
     SELECT DISTINCT
       'DELIVERED_NOT_BILLED' AS anomaly_type,
@@ -516,6 +599,8 @@ function buildSchemaSummary(): string {
     "- v_sales_flow: one row per sales order item with downstream delivery, billing, journal entry, and payment columns.",
     "- v_billing_flow: billing-centric trace view from billing document to delivery, sales order, accounting, and payment.",
     "- v_product_billing_stats: product billing rollup with billing_document_count and total_billed_amount.",
+    "- v_customer_revenue_stats: billed revenue, billing-document coverage, and open receivables by customer.",
+    "- v_document_links: graph-style source/target links across customer, order, delivery, billing, journal, and payment documents.",
     "- v_flow_anomalies: anomaly_type, sales_order, delivery_document, billing_document, accounting_document, customer, product, detail.",
     "- v_customer_master: customer, address, company assignment, and sales area attributes.",
     "- v_product_master: product master plus description, plant_count, and storage_location_count.",
@@ -527,6 +612,149 @@ function buildSchemaSummary(): string {
     "- Only SELECT or CTE-based read queries are allowed.",
     "- Prefer v_sales_flow, v_billing_flow, v_product_billing_stats, and v_flow_anomalies for analyst questions."
   ].join("\n");
+}
+
+function buildAnalyticsSummary(
+  db: Database,
+  lookup: DataModel["lookup"]
+): AnalyticsSummary {
+  const flowBreakdown = executeRows(
+    db,
+    `
+      SELECT flow_status AS label, COUNT(*) AS count
+      FROM v_sales_flow
+      GROUP BY flow_status
+      ORDER BY count DESC
+    `
+  ).map((row) => ({
+    label: String(row.label),
+    count: Number(row.count)
+  }));
+
+  const anomalyBreakdown = executeRows(
+    db,
+    `
+      SELECT anomaly_type AS label, COUNT(*) AS count
+      FROM v_flow_anomalies
+      GROUP BY anomaly_type
+      ORDER BY count DESC
+    `
+  ).map((row) => ({
+    label: String(row.label),
+    count: Number(row.count)
+  }));
+
+  const topProducts = executeRows(
+    db,
+    `
+      SELECT product_id, product_description, billing_document_count
+      FROM v_product_billing_stats
+      ORDER BY billing_document_count DESC, total_billed_amount DESC
+      LIMIT 5
+    `
+  ).map((row) => ({
+    id: String(row.product_id),
+    label: String(row.product_description),
+    primaryMetric: Number(row.billing_document_count)
+  }));
+
+  const topCustomers = executeRows(
+    db,
+    `
+      SELECT customer_id, customer_name, total_billed_amount, open_billing_documents
+      FROM v_customer_revenue_stats
+      ORDER BY total_billed_amount DESC
+      LIMIT 5
+    `
+  ).map((row) => ({
+    id: String(row.customer_id),
+    label: String(row.customer_name),
+    primaryMetric: Number(row.total_billed_amount),
+    secondaryMetric: Number(row.open_billing_documents)
+  }));
+
+  const deliveredNotBilled = anomalyBreakdown.find(
+    (item) => item.label === "DELIVERED_NOT_BILLED"
+  )?.count ?? 0;
+  const billedNotPaid = anomalyBreakdown.find(
+    (item) => item.label === "BILLED_NOT_PAID"
+  )?.count ?? 0;
+  const paidRows = flowBreakdown.find((item) => item.label === "PAID")?.count ?? 0;
+
+  const riskSpotlights: AnalyticsSummary["riskSpotlights"] = [];
+  const topOpenCustomer = topCustomers.find(
+    (item) => (item.secondaryMetric ?? 0) > 0
+  );
+  if (topOpenCustomer) {
+    riskSpotlights.push({
+      title: "Open Receivables Hotspot",
+      detail: `${topOpenCustomer.label} has ${topOpenCustomer.secondaryMetric} open billed document(s).`,
+      nodeIds: [lookup.customers.get(topOpenCustomer.id)].filter(
+        (candidate): candidate is string => Boolean(candidate)
+      )
+    });
+  }
+  if (deliveredNotBilled > 0) {
+    riskSpotlights.push({
+      title: "Delivery-to-Billing Breaks",
+      detail: `${deliveredNotBilled} flow row(s) are delivered but not billed.`,
+      nodeIds: []
+    });
+  }
+  if (billedNotPaid > 0) {
+    riskSpotlights.push({
+      title: "Uncleared Billing Documents",
+      detail: `${billedNotPaid} billed flow row(s) remain posted but unpaid.`,
+      nodeIds: []
+    });
+  }
+
+  return {
+    metricCards: [
+      {
+        label: "Paid Flow Rows",
+        value: paidRows,
+        tone: "good",
+        detail: "Rows in the curated sales-flow view that have completed payment."
+      },
+      {
+        label: "Delivered Not Billed",
+        value: deliveredNotBilled,
+        tone: deliveredNotBilled > 0 ? "warning" : "good",
+        detail: "Rows where delivery exists but no downstream billing document is found."
+      },
+      {
+        label: "Posted Not Paid",
+        value: billedNotPaid,
+        tone: billedNotPaid > 0 ? "warning" : "good",
+        detail: "Posted billing rows that still have no clearing payment document."
+      },
+      {
+        label: "Searchable Graph Nodes",
+        value: lookup.genericIds.size,
+        tone: "accent",
+        detail: "Unique business identifiers indexed for graph search and query focus."
+      }
+    ],
+    flowBreakdown,
+    anomalyBreakdown,
+    topProducts,
+    topCustomers,
+    riskSpotlights
+  };
+}
+
+function executeRows(db: Database, sql: string): Array<Record<string, JsonValue>> {
+  const result = db.exec(sql)[0];
+  if (!result) {
+    return [];
+  }
+
+  return result.values.map((valueRow) =>
+    Object.fromEntries(
+      valueRow.map((value, index) => [result.columns[index], toMetadataValue(value)])
+    )
+  );
 }
 
 function buildGraph(raw: RawDatasets) {
@@ -1084,6 +1312,62 @@ export function collectTraceHighlight(
   }
 
   return Array.from(seen);
+}
+
+export function searchNodes(model: DataModel, query: string): SearchResult[] {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) {
+    return [];
+  }
+
+  const terms = normalized.split(/\s+/).filter(Boolean);
+  const results: SearchResult[] = [];
+
+  for (const node of model.allNodes.values()) {
+    const haystacks = [
+      node.id.toLowerCase(),
+      node.label.toLowerCase(),
+      node.summary.toLowerCase(),
+      JSON.stringify(node.metadata).toLowerCase()
+    ];
+
+    let score = 0;
+    if (node.id.toLowerCase().includes(normalized)) {
+      score += 120;
+    }
+    if (node.label.toLowerCase().includes(normalized)) {
+      score += 90;
+    }
+    if (node.summary.toLowerCase().includes(normalized)) {
+      score += 40;
+    }
+
+    for (const term of terms) {
+      for (const haystack of haystacks) {
+        if (haystack.includes(term)) {
+          score += 8;
+        }
+      }
+    }
+
+    if (score > 0) {
+      results.push({
+        nodeId: node.id,
+        label: node.label,
+        kind: node.kind,
+        summary: node.summary,
+        score,
+        reason:
+          node.id.toLowerCase().includes(normalized)
+            ? "Matched business identifier"
+            : node.label.toLowerCase().includes(normalized)
+              ? "Matched node label"
+              : "Matched node summary or metadata"
+      });
+    }
+  }
+
+  return results.sort((a, b) => b.score - a.score).slice(0, 12);
 }
 
 function addNode(

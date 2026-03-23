@@ -8,11 +8,14 @@ type ChatMessage = {
   engine?: string;
   rowCount?: number;
   rejected?: boolean;
+  planSteps?: string[];
+  status?: string | null;
 };
 
 type ChatPanelProps = {
   messages: ChatMessage[];
   loading: boolean;
+  streamStatus: string | null;
   suggestions: string[];
   latestResult: QueryResponse | null;
   onSend: (question: string) => void;
@@ -21,6 +24,7 @@ type ChatPanelProps = {
 export function ChatPanel({
   messages,
   loading,
+  streamStatus,
   suggestions,
   latestResult,
   onSend
@@ -63,6 +67,7 @@ export function ChatPanel({
       </div>
 
       <div className="chat-messages">
+        {streamStatus && <div className="stream-status">{streamStatus}</div>}
         {messages.map((message, index) => (
           <article
             key={`${message.role}-${index}`}
@@ -76,6 +81,13 @@ export function ChatPanel({
               )}
             </div>
             <p>{message.content}</p>
+            {message.planSteps && message.planSteps.length > 0 && (
+              <div className="plan-steps">
+                {message.planSteps.map((step) => (
+                  <span key={step}>{step}</span>
+                ))}
+              </div>
+            )}
             {message.sql && (
               <details className="sql-block">
                 <summary>SQL used</summary>

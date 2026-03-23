@@ -2,6 +2,7 @@ import type { Database } from "sql.js";
 import {
   type ChatMessage,
   type JsonValue,
+  type QueryFocus,
   type QueryResponse
 } from "../../shared/types.js";
 import {
@@ -23,6 +24,7 @@ type RulePlan = {
   intent: string;
   sql: string;
   answer: (rows: QueryRows) => string;
+  planSteps: string[];
   highlights?: (rows: QueryRows) => string[];
 };
 
@@ -34,6 +36,166 @@ type GeminiPlan = {
 };
 
 const geminiClient = new GeminiClient();
+
+export async function streamAnswerQuestion(
+  model: DataModel,
+  question: string,
+  conversation: ChatMessage[],
+  emit: (event: { type: string; payload: JsonValue }) => void
+): Promise<QueryResponse> {
+  emit({
+    type: "status",
+    payload: "Validating the question against dataset guardrails."
+  });
+
+  const domainCheck = evaluateQuestionDomain(question, model);
+  if (!domainCheck.allowed) {
+    const rejected: QueryResponse = {
+      rejected: true,
+      answer: domainCheck.reason ?? "This system is designed for dataset questions only.",
+      sql: null,
+      columns: [],
+      rows: [],
+      highlights: [],
+      focus: null,
+      intent: "guardrail",
+      engine: "guardrail",
+      reason: domainCheck.reason,
+      planSteps: [
+        "Rejected the prompt because it falls outside the dataset domain guardrails."
+      ],
+      suggestions: model.examplePrompts
+    };
+    emit({ type: "answer", payload: rejected.answer });
+    emit({ type: "done", payload: rejected as unknown as JsonValue });
+    return rejected;
+  }
+
+  const rulePlan = planRuleQuestion(question, model);
+  if (rulePlan) {
+    emit({
+      type: "plan",
+      payload: {
+        engine: "rule",
+        intent: rulePlan.intent,
+        steps: rulePlan.planSteps
+      } as unknown as JsonValue
+    });
+    const executed = executeSql(model.db, rulePlan.sql);
+    const highlights =
+      rulePlan.highlights?.(executed.rows) ?? inferHighlights(executed.rows, model);
+    const response: QueryResponse = {
+      rejected: false,
+      answer: rulePlan.answer(executed.rows),
+      sql: executed.sql,
+      columns: executed.columns,
+      rows: executed.rows,
+      highlights,
+      focus: buildFocus(model, highlights, question),
+      intent: rulePlan.intent,
+      engine: "rule",
+      planSteps: rulePlan.planSteps,
+      suggestions: nextSuggestions(model, question)
+    };
+    emit({ type: "sql", payload: executed.sql });
+    emit({
+      type: "rows",
+      payload: {
+        count: executed.rows.length,
+        preview: executed.rows.slice(0, 5)
+      } as unknown as JsonValue
+    });
+    emit({ type: "answer", payload: response.answer });
+    emit({ type: "done", payload: response as unknown as JsonValue });
+    return response;
+  }
+
+  if (!geminiClient.isConfigured()) {
+    const rejected: QueryResponse = {
+      rejected: true,
+      answer:
+        "The built-in planners handle the core flow questions, but broader natural-language SQL generation requires a Gemini API key. Add your key to GEMINI_API_KEY to enable open-ended analyst queries.",
+      sql: null,
+      columns: [],
+      rows: [],
+      highlights: [],
+      focus: null,
+      intent: "missing-llm-key",
+      engine: "guardrail",
+      planSteps: [
+        "No deterministic rule matched the question.",
+        "A Gemini API key is required for open-ended SQL generation."
+      ],
+      suggestions: model.examplePrompts
+    };
+    emit({ type: "answer", payload: rejected.answer });
+    emit({ type: "done", payload: rejected as unknown as JsonValue });
+    return rejected;
+  }
+
+  emit({
+    type: "status",
+    payload: "Generating read-only SQL from the natural-language question."
+  });
+  const plan = await generateGeminiPlan(model, question, conversation);
+  if (plan.decision === "reject") {
+    const rejected: QueryResponse = {
+      rejected: true,
+      answer:
+        plan.reason ??
+        "This system is designed to answer questions related to the provided dataset only.",
+      sql: null,
+      columns: [],
+      rows: [],
+      highlights: [],
+      focus: null,
+      intent: plan.intent || "guardrail",
+      engine: "guardrail",
+      reason: plan.reason,
+      planSteps: ["Gemini classified the prompt as out of domain and rejected it."],
+      suggestions: model.examplePrompts
+    };
+    emit({ type: "answer", payload: rejected.answer });
+    emit({ type: "done", payload: rejected as unknown as JsonValue });
+    return rejected;
+  }
+
+  const executed = executeSql(model.db, plan.sql);
+  emit({ type: "sql", payload: executed.sql });
+  emit({
+    type: "rows",
+    payload: {
+      count: executed.rows.length,
+      preview: executed.rows.slice(0, 5)
+    } as unknown as JsonValue
+  });
+  emit({
+    type: "status",
+    payload: "Summarizing the SQL result into a grounded natural-language answer."
+  });
+  const answer = await summarizeWithGemini(question, executed.sql, executed.rows);
+  const highlights = inferHighlights(executed.rows, model);
+  const response: QueryResponse = {
+    rejected: false,
+    answer,
+    sql: executed.sql,
+    columns: executed.columns,
+    rows: executed.rows,
+    highlights,
+    focus: buildFocus(model, highlights, question),
+    intent: plan.intent || "gemini-sql",
+    engine: "gemini",
+    planSteps: [
+      "Validated the question against dataset guardrails.",
+      "Generated read-only SQL against curated business views.",
+      "Executed the SQL and summarized only the returned rows."
+    ],
+    suggestions: nextSuggestions(model, question)
+  };
+  emit({ type: "answer", payload: response.answer });
+  emit({ type: "done", payload: response as unknown as JsonValue });
+  return response;
+}
 
 export async function answerQuestion(
   model: DataModel,
@@ -49,9 +211,11 @@ export async function answerQuestion(
       columns: [],
       rows: [],
       highlights: [],
+      focus: null,
       intent: "guardrail",
       engine: "guardrail",
       reason: domainCheck.reason,
+      planSteps: ["Rejected the prompt because it falls outside the dataset domain guardrails."],
       suggestions: model.examplePrompts
     };
   }
@@ -59,15 +223,19 @@ export async function answerQuestion(
   const rulePlan = planRuleQuestion(question, model);
   if (rulePlan) {
     const executed = executeSql(model.db, rulePlan.sql);
+    const highlights =
+      rulePlan.highlights?.(executed.rows) ?? inferHighlights(executed.rows, model);
     return {
       rejected: false,
       answer: rulePlan.answer(executed.rows),
       sql: executed.sql,
       columns: executed.columns,
       rows: executed.rows,
-      highlights: rulePlan.highlights?.(executed.rows) ?? inferHighlights(executed.rows, model),
+      highlights,
+      focus: buildFocus(model, highlights, question),
       intent: rulePlan.intent,
       engine: "rule",
+      planSteps: rulePlan.planSteps,
       suggestions: nextSuggestions(model, question)
     };
   }
@@ -81,8 +249,13 @@ export async function answerQuestion(
       columns: [],
       rows: [],
       highlights: [],
+      focus: null,
       intent: "missing-llm-key",
       engine: "guardrail",
+      planSteps: [
+        "No deterministic rule matched the question.",
+        "A Gemini API key is required for open-ended SQL generation."
+      ],
       suggestions: model.examplePrompts
     };
   }
@@ -99,24 +272,33 @@ export async function answerQuestion(
         columns: [],
         rows: [],
         highlights: [],
+        focus: null,
         intent: plan.intent || "guardrail",
         engine: "guardrail",
         reason: plan.reason,
+        planSteps: ["Gemini classified the prompt as out of domain and rejected it."],
         suggestions: model.examplePrompts
       };
     }
 
     const executed = executeSql(model.db, plan.sql);
     const answer = await summarizeWithGemini(question, executed.sql, executed.rows);
+    const highlights = inferHighlights(executed.rows, model);
     return {
       rejected: false,
       answer,
       sql: executed.sql,
       columns: executed.columns,
       rows: executed.rows,
-      highlights: inferHighlights(executed.rows, model),
+      highlights,
+      focus: buildFocus(model, highlights, question),
       intent: plan.intent || "gemini-sql",
       engine: "gemini",
+      planSteps: [
+        "Validated the question against dataset guardrails.",
+        "Generated read-only SQL against curated business views.",
+        "Executed the SQL and summarized only the returned rows."
+      ],
       suggestions: nextSuggestions(model, question)
     };
   } catch (error) {
@@ -129,9 +311,11 @@ export async function answerQuestion(
       columns: [],
       rows: [],
       highlights: [],
+      focus: null,
       intent: "query-error",
       engine: "guardrail",
       reason,
+      planSteps: ["Query planning failed before a safe answer could be returned."],
       suggestions: model.examplePrompts
     };
   }
@@ -158,6 +342,10 @@ function planRuleQuestion(question: string, model: DataModel): RulePlan | null {
         ORDER BY billing_document_count DESC, total_billed_amount DESC, product_id
         LIMIT 10
       `,
+      planSteps: [
+        "Matched the question to the curated product-billing ranking rule.",
+        "Queried v_product_billing_stats for distinct billing-document coverage."
+      ],
       answer: (rows) => summarizeTopProducts(rows),
       highlights: (rows) =>
         rows
@@ -198,6 +386,10 @@ function planRuleQuestion(question: string, model: DataModel): RulePlan | null {
         ORDER BY anomaly_type, sales_order, delivery_document, billing_document
         LIMIT 25
       `,
+      planSteps: [
+        "Matched the question to anomaly analysis.",
+        "Queried v_flow_anomalies to return only broken or incomplete flows."
+      ],
       answer: (rows) => summarizeAnomalies(rows),
       highlights: (rows) => inferHighlights(rows, model)
     };
@@ -224,6 +416,10 @@ function planRuleQuestion(question: string, model: DataModel): RulePlan | null {
         FROM v_billing_flow
         WHERE billing_document = '${escapeSqlLiteral(primary.id)}'
       `,
+      planSteps: [
+        `Resolved ${primary.id} as a billing document.`,
+        "Queried the billing-centric trace view to recover its accounting document."
+      ],
       answer: (rows) => summarizeBillingToJournal(primary.id, rows),
       highlights: () => collectTraceHighlight(model, primary.nodeId, 3)
     };
@@ -346,6 +542,10 @@ function createTracePlan(
   return {
     intent: `trace-${primary.kind}`,
     sql: config.sql,
+    planSteps: [
+      `Resolved ${primary.id} as a ${config.label}.`,
+      "Ran the trace against the curated flow view to recover upstream and downstream documents."
+    ],
     answer: (rows) => summarizeTrace(primary.id, config.label, rows),
     highlights: () => collectTraceHighlight(model, primary.nodeId, 3)
   };
@@ -555,6 +755,28 @@ function inferHighlights(rows: QueryRows, model: DataModel): string[] {
     }
   }
   return Array.from(highlights).slice(0, 20);
+}
+
+function buildFocus(
+  model: DataModel,
+  nodes: string[],
+  question: string
+): QueryFocus | null {
+  if (nodes.length === 0) {
+    return null;
+  }
+
+  const selected = new Set(nodes);
+  const edges = Array.from(model.allEdges.values())
+    .filter((edge) => selected.has(edge.source) && selected.has(edge.target))
+    .slice(0, 40)
+    .map((edge) => edge.id);
+
+  return {
+    title: `Focus for: ${question}`,
+    nodes,
+    edges
+  };
 }
 
 function resolvePrimaryEntity(

@@ -2,10 +2,14 @@ import fs from "node:fs";
 import path from "node:path";
 import express from "express";
 import cors from "cors";
-import { answerQuestion } from "./services/query-service.js";
+import {
+  answerQuestion,
+  streamAnswerQuestion
+} from "./services/query-service.js";
 import {
   buildDataModel,
-  getNodeDetails
+  getNodeDetails,
+  searchNodes
 } from "./services/data-model.js";
 import type { QueryRequest } from "../shared/types.js";
 
@@ -42,6 +46,11 @@ async function startServer(): Promise<void> {
     response.json(details);
   });
 
+  app.get("/api/search", (request, response) => {
+    const query = String(request.query.q ?? "");
+    response.json(searchNodes(model, query));
+  });
+
   app.post("/api/query", async (request, response) => {
     const body = request.body as QueryRequest;
     if (!body?.question?.trim()) {
@@ -55,6 +64,39 @@ async function startServer(): Promise<void> {
       Array.isArray(body.conversation) ? body.conversation : []
     );
     response.json(result);
+  });
+
+  app.post("/api/query/stream", async (request, response) => {
+    const body = request.body as QueryRequest;
+    if (!body?.question?.trim()) {
+      response.status(400).json({ error: "Question is required." });
+      return;
+    }
+
+    response.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+    response.setHeader("Cache-Control", "no-cache");
+    response.setHeader("Connection", "keep-alive");
+
+    const emit = (event: { type: string; payload: unknown }) => {
+      response.write(`${JSON.stringify(event)}\n`);
+    };
+
+    try {
+      await streamAnswerQuestion(
+        model,
+        body.question,
+        Array.isArray(body.conversation) ? body.conversation : [],
+        emit
+      );
+    } catch (error) {
+      emit({
+        type: "error",
+        payload:
+          error instanceof Error ? error.message : "Unexpected streaming failure."
+      });
+    } finally {
+      response.end();
+    }
   });
 
   const clientDirectory = path.join(rootDirectory, "dist", "client");
