@@ -2,7 +2,7 @@
 
 An evaluator-ready graph-based data modeling and query system for the provided SAP-style Order-to-Cash dataset.
 
-## What Makes This Submission Strong
+## What Makes This Strong
 
 - Full order-to-cash graph across `Customer -> Sales Order -> Delivery -> Billing -> Journal Entry -> Payment`
 - Supporting master-data context for addresses, products, plants, customer assignments, product plants, schedule lines, and storage locations
@@ -15,6 +15,12 @@ An evaluator-ready graph-based data modeling and query system for the provided S
 - Model-provider abstraction so the LLM layer can evolve without rewriting graph or safety logic
 - Dataset verification script for key evaluator questions
 - AI session log artifact for submission packaging
+
+## IMAGES
+<img width="1905" height="916" alt="Screenshot 2026-03-24 222022" src="https://github.com/user-attachments/assets/7876f6d4-e64f-4133-af33-c191ac1670fc" />
+
+<img width="1430" height="788" alt="Screenshot 2026-03-24 221831" src="https://github.com/user-attachments/assets/87dc1919-9557-4402-a640-e45184ebe12b" />
+
 
 ## Architecture
 
