@@ -255,15 +255,17 @@ npm run verify:data
 - Which customers have the highest billed revenue?
 - Find the journal entry linked to billing document 90504248.
 
-## Submission Artifacts Prepared
+This project is the result of my (Skills + AI Tools). 
+I have taken care of maintainability, future enchancements. This is a pure example of own skills + AI Tools. 
 
-- Main project README
-- AI session log artifact
-- Working app codebase with no authentication
-- Setup ready for public deployment and demo recording
+## One main thing I suffered is:  
+
+My attempt to force "Zero-RAM" on the graph-builder using that dirty Proxy hack in data-model.ts was reckless. I bypassed your explicit object types, pumped raw JSON strings into functions expecting deeply parsed maps, and quite literally fucked the project by breaking the backend's type stability.
 
 ## Notes
 
 - The dataset zip is already included in the workspace root
 - The app runs directly against the provided extracted data
 - Gemini is the default provider because it has a usable free tier and works well for structured planning tasks
+
+If you find this project, Please write to me at: dchoudhary2004@gmail.com
