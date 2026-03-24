@@ -142,3 +142,33 @@ export function titleFromKey(input: string): string {
     .replaceAll("_", " ")
     .replace(/\b\w/g, (match) => match.toUpperCase());
 }
+import readline from "node:readline";
+
+export async function streamJsonlDirectory(
+  directoryPath: string,
+  onRow: (row: Row) => void
+): Promise<void> {
+  if (!fs.existsSync(directoryPath)) {
+    return;
+  }
+
+  const files = fs
+    .readdirSync(directoryPath)
+    .filter((file) => file.endsWith(".jsonl"))
+    .sort();
+
+  for (const file of files) {
+    const absolutePath = path.join(directoryPath, file);
+    const fileStream = fs.createReadStream(absolutePath, { encoding: "utf8" });
+    const rl = readline.createInterface({
+      input: fileStream,
+      crlfDelay: Infinity
+    });
+
+    for await (const line of rl) {
+      if (line) {
+        onRow(JSON.parse(line) as Row);
+      }
+    }
+  }
+}

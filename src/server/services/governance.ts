@@ -3,21 +3,16 @@ import type {
   JsonValue,
   NodeKind
 } from "../../shared/types.js";
+import {
+  CURATED_QUERY_SOURCES,
+  RESTRICTED_COLUMN_NAMES
+} from "../storage/semantic-layer.js";
 
 export const GOVERNANCE_SUMMARY: GovernanceSummary = {
   ontologyVersion: "2026.03-o2c-graph",
   policyVersion: "2026.03-privacy-guardrails",
   privacyMode: "balanced-public-demo",
-  curatedQuerySources: [
-    "v_sales_flow",
-    "v_billing_flow",
-    "v_product_billing_stats",
-    "v_customer_revenue_stats",
-    "v_flow_anomalies",
-    "v_customer_master",
-    "v_product_master",
-    "v_document_links"
-  ],
+  curatedQuerySources: [...CURATED_QUERY_SOURCES],
   sensitiveFieldGroups: {
     address: ["street_name", "postal_code", "address_id", "city", "region"],
     contact: [
@@ -159,21 +154,10 @@ export const FORBIDDEN_SQL = /\b(insert|update|delete|drop|alter|attach|detach|p
 export const SELECT_STAR_SQL = /\bselect\s+\*/i;
 
 export const SENSITIVE_COLUMNS = new Set<string>([
-  "address_id",
-  "street_name",
-  "postal_code",
+  ...Array.from(RESTRICTED_COLUMN_NAMES),
   "city",
   "region",
-  "country",
-  "firstName",
-  "lastName",
-  "businessPartnerFullName",
-  "businessPartnerName",
-  "organizationBpName1",
-  "organizationBpName2",
-  "accountingClerkFaxNumber",
-  "accountingClerkInternetAddress",
-  "accountingClerkPhoneNumber"
+  "country"
 ]);
 
 export function maskSensitiveValue(column: string, value: JsonValue): JsonValue {

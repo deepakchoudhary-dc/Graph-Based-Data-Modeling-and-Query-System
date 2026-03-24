@@ -1,32 +1,17 @@
-import {
-  type ChatMessage,
-  type JsonValue,
-  type QueryFocus,
-  type QueryResponse
+import type {
+  JsonValue,
+  QueryFocus
 } from "../../shared/types.js";
+import { escapeSqlLiteral } from "../utils/jsonl.js";
 import {
   collectTraceHighlight,
   type DataModel
 } from "./data-model.js";
-import { createDefaultLlmProvider } from "./llm-provider.js";
-import {
-  answerQuestionAdvanced,
-  streamAnswerQuestionAdvanced
-} from "./query-runtime.js";
-import {
-  ensureLimit,
-  evaluateQuestionDomain,
-  extractKnownIds,
-  sanitizeQueryResult,
-  validateReadOnlySql
-} from "./guardrails.js";
-import { escapeSqlLiteral } from "../utils/jsonl.js";
-import { GOVERNANCE_SUMMARY } from "./governance.js";
+import { extractKnownIds } from "./guardrails.js";
 
-type Database = any;
-type QueryRows = Array<Record<string, JsonValue>>;
+export type QueryRows = Array<Record<string, JsonValue>>;
 
-type RulePlan = {
+export type RulePlan = {
   intent: string;
   sql: string;
   answer: (rows: QueryRows) => string;
@@ -34,33 +19,10 @@ type RulePlan = {
   highlights?: (rows: QueryRows) => string[];
 };
 
-type GeminiPlan = {
-  decision: "answer" | "reject";
-  intent: string;
-  sql: string;
-  reason?: string;
-};
-
-const llmProvider = createDefaultLlmProvider();
-
-export async function streamAnswerQuestion(
-  model: DataModel,
+export function planRuleQuestion(
   question: string,
-  conversation: ChatMessage[],
-  emit: (event: { type: string; payload: JsonValue }) => void
-): Promise<QueryResponse> {
-  return streamAnswerQuestionAdvanced(model, question, conversation, emit);
-}
-
-export async function answerQuestion(
-  model: DataModel,
-  question: string,
-  conversation: ChatMessage[]
-): Promise<QueryResponse> {
-  return answerQuestionAdvanced(model, question, conversation);
-}
-
-function planRuleQuestion(question: string, model: DataModel): RulePlan | null {
+  model: DataModel
+): RulePlan | null {
   const normalized = question.toLowerCase();
 
   if (
@@ -173,6 +135,60 @@ function planRuleQuestion(question: string, model: DataModel): RulePlan | null {
   }
 
   return null;
+}
+
+export function inferHighlights(rows: QueryRows, model: DataModel): string[] {
+  const highlights = new Set<string>();
+  for (const row of rows) {
+    for (const value of Object.values(row)) {
+      if (typeof value !== "string" && typeof value !== "number") {
+        continue;
+      }
+      const stringValue = String(value);
+      const candidates = [
+        model.lookup.customers.get(stringValue),
+        model.lookup.products.get(stringValue),
+        model.lookup.salesOrders.get(stringValue),
+        model.lookup.deliveries.get(stringValue),
+        model.lookup.billings.get(stringValue),
+        model.lookup.journals.get(stringValue),
+        model.lookup.payments.get(stringValue)
+      ].filter((candidate): candidate is string => Boolean(candidate));
+
+      for (const candidate of candidates) {
+        highlights.add(candidate);
+      }
+    }
+  }
+  return Array.from(highlights).slice(0, 20);
+}
+
+export function buildFocus(
+  model: DataModel,
+  nodes: string[],
+  question: string
+): QueryFocus | null {
+  if (nodes.length === 0) {
+    return null;
+  }
+
+  const selected = new Set(nodes);
+  const edges = Array.from(model.allEdges.values())
+    .filter((edge) => selected.has(edge.source) && selected.has(edge.target))
+    .slice(0, 40)
+    .map((edge) => edge.id);
+
+  return {
+    title: `Focus for: ${question}`,
+    nodes,
+    edges
+  };
+}
+
+export function nextSuggestions(model: DataModel, question: string): string[] {
+  return model.examplePrompts
+    .filter((prompt) => prompt.toLowerCase() !== question.toLowerCase())
+    .slice(0, 4);
 }
 
 function createTracePlan(
@@ -290,109 +306,6 @@ function createTracePlan(
   };
 }
 
-async function generateGeminiPlan(
-  model: DataModel,
-  question: string,
-  conversation: ChatMessage[]
-): Promise<GeminiPlan> {
-  const prompt = [
-    "You are planning a dataset-backed SQL query for an Order-to-Cash analytics system.",
-    "Only answer questions grounded in the provided dataset schema.",
-    "Reject requests that are off-topic, creative, or general knowledge.",
-    `Use only read-only SQLite SQL against these curated sources: ${GOVERNANCE_SUMMARY.curatedQuerySources.join(", ")}.`,
-    "Never use raw base tables.",
-    "Never use SELECT *.",
-    "Always add a LIMIT of 50 or less.",
-    "Avoid selecting address or contact fields unless they are essential, and prefer aggregate answers over bulk extraction.",
-    "",
-    "Return strict JSON with this shape:",
-    '{"decision":"answer|reject","intent":"short-intent","sql":"SELECT ...","reason":"optional"}',
-    "",
-    "Schema summary:",
-    model.schemaSummary,
-    "",
-    "Conversation context:",
-    conversation
-      .slice(-6)
-      .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
-      .join("\n"),
-    "",
-    `Current question: ${question}`
-  ].join("\n");
-
-  const plan = await llmProvider.generateJson<GeminiPlan>(prompt);
-  const validation = validateReadOnlySql(plan.sql ?? "", model.semanticCatalog as any, {
-    maxRows: 50
-  });
-  if (plan.decision === "answer" && !validation.valid) {
-    throw new Error(validation.reason ?? "Generated SQL failed validation.");
-  }
-  return plan;
-}
-
-async function summarizeWithGemini(
-  question: string,
-  sql: string,
-  rows: QueryRows
-): Promise<string> {
-  const prompt = [
-    "You are summarizing the result of a dataset-backed SQL query for an Order-to-Cash analyst.",
-    "Answer only from the provided rows.",
-    "Do not invent facts or values that are not present.",
-    "If rows are empty, clearly say no matching records were found.",
-    "Keep the answer to 4 short sentences or fewer.",
-    "",
-    `Question: ${question}`,
-    `SQL: ${sql}`,
-    `Rows: ${JSON.stringify(rows.slice(0, 25))}`
-  ].join("\n");
-
-  return llmProvider.generateText(prompt);
-}
-
-function executeSql(db: Database, sql: string): {
-  sql: string;
-  columns: string[];
-  rows: QueryRows;
-} {
-  const normalized = ensureLimit(sql);
-  const validation = validateReadOnlySql(normalized, {} as any, { maxRows: 50 });
-  if (!validation.valid) {
-    throw new Error(validation.reason ?? "SQL validation failed.");
-  }
-
-  const result = db.exec(normalized)[0];
-  if (!result) {
-    return {
-      sql: normalized,
-      columns: [],
-      rows: []
-    };
-  }
-
-  const columns = result.columns;
-  const rows = result.values.map((valueRow: unknown[]) =>
-    Object.fromEntries(
-      valueRow.map((value: unknown, index: number) => [
-        columns[index],
-        normalizeValue(value)
-      ])
-    )
-  );
-
-  return { sql: normalized, columns, rows };
-}
-
-function normalizeValue(value: unknown): JsonValue {
-  if (value === null || value === undefined) {
-    return null;
-  }
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return value;
-  }
-  return JSON.stringify(value);
-}
-
 function summarizeTopProducts(rows: QueryRows): string {
   if (rows.length === 0) {
     return "No billed products were found in the dataset.";
@@ -428,7 +341,10 @@ function summarizeAnomalies(rows: QueryRows): string {
   return `I found ${rows.length} anomaly rows in the returned slice. Breakdown: ${summary}. The first example is sales order ${sample.sales_order ?? "n/a"} with detail: ${sample.detail}.`;
 }
 
-function summarizeBillingToJournal(billingDocument: string, rows: QueryRows): string {
+function summarizeBillingToJournal(
+  billingDocument: string,
+  rows: QueryRows
+): string {
   if (rows.length === 0) {
     return `No accounting document was found for billing document ${billingDocument}.`;
   }
@@ -436,7 +352,9 @@ function summarizeBillingToJournal(billingDocument: string, rows: QueryRows): st
   const accountingDocuments = uniqueValues(rows, "accounting_document");
   const payments = uniqueValues(rows, "payment_document");
   const paymentText =
-    payments.length > 0 ? ` It is cleared by payment ${payments.join(", ")}.` : " It is not yet cleared by a payment document.";
+    payments.length > 0
+      ? ` It is cleared by payment ${payments.join(", ")}.`
+      : " It is not yet cleared by a payment document.";
   return `Billing document ${billingDocument} posts to journal entry ${accountingDocuments.join(", ")}.${paymentText}`;
 }
 
@@ -472,54 +390,6 @@ function uniqueValues(rows: QueryRows, key: string): string[] {
         .map((value) => String(value))
     )
   );
-}
-
-function inferHighlights(rows: QueryRows, model: DataModel): string[] {
-  const highlights = new Set<string>();
-  for (const row of rows) {
-    for (const value of Object.values(row)) {
-      if (typeof value !== "string" && typeof value !== "number") {
-        continue;
-      }
-      const stringValue = String(value);
-      const candidates = [
-        model.lookup.customers.get(stringValue),
-        model.lookup.products.get(stringValue),
-        model.lookup.salesOrders.get(stringValue),
-        model.lookup.deliveries.get(stringValue),
-        model.lookup.billings.get(stringValue),
-        model.lookup.journals.get(stringValue),
-        model.lookup.payments.get(stringValue)
-      ].filter((candidate): candidate is string => Boolean(candidate));
-
-      for (const candidate of candidates) {
-        highlights.add(candidate);
-      }
-    }
-  }
-  return Array.from(highlights).slice(0, 20);
-}
-
-function buildFocus(
-  model: DataModel,
-  nodes: string[],
-  question: string
-): QueryFocus | null {
-  if (nodes.length === 0) {
-    return null;
-  }
-
-  const selected = new Set(nodes);
-  const edges = Array.from(model.allEdges.values())
-    .filter((edge) => selected.has(edge.source) && selected.has(edge.target))
-    .slice(0, 40)
-    .map((edge) => edge.id);
-
-  return {
-    title: `Focus for: ${question}`,
-    nodes,
-    edges
-  };
 }
 
 function resolvePrimaryEntity(
@@ -566,10 +436,4 @@ function resolvePrimaryEntity(
   }
 
   return null;
-}
-
-function nextSuggestions(model: DataModel, question: string): string[] {
-  return model.examplePrompts
-    .filter((prompt) => prompt.toLowerCase() !== question.toLowerCase())
-    .slice(0, 4);
 }

@@ -31,3 +31,7 @@ unzip/
 # Secrets files
 secrets.txt
 *.secret
+report.md
+
+# Generated output
+/generated/

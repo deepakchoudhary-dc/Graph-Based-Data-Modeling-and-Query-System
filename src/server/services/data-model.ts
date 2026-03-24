@@ -1,6 +1,3 @@
-import fs from "node:fs";
-import path from "node:path";
-import initSqlJs, { type Database } from "sql.js";
 import {
   type AnalyticsSummary,
   type GraphEdge,
@@ -15,12 +12,12 @@ import {
   asIntegerKey,
   asNullableString,
   asString,
-  readJsonlDirectory,
   safeNumber,
-  toDbValue,
   toDisplayValue,
   titleFromKey
 } from "../utils/jsonl.js";
+import { initializePersistentDatabase, executeQuery } from "../storage/persistent-database.js";
+import type { SemanticCatalog, SqliteDatabase } from "../storage/semantic-layer.js";
 import {
   GOVERNANCE_SUMMARY,
   maskSensitiveValue,
@@ -37,12 +34,13 @@ type ExpansionPayload = {
 };
 
 export interface DataModel {
-  db: Database;
+  db: SqliteDatabase;
   graph: GraphPayload;
   allNodes: Map<string, GraphNode>;
   allEdges: Map<string, GraphEdge>;
   adjacency: Map<string, Set<string>>;
   expansions: Map<string, ExpansionPayload>;
+  semanticCatalog: SemanticCatalog;
   schemaSummary: string;
   examplePrompts: string[];
   lookup: {
@@ -56,28 +54,6 @@ export interface DataModel {
     genericIds: Map<string, string[]>;
   };
 }
-
-const DATASET_NAMES = [
-  "billing_document_cancellations",
-  "billing_document_headers",
-  "billing_document_items",
-  "business_partners",
-  "business_partner_addresses",
-  "customer_company_assignments",
-  "customer_sales_area_assignments",
-  "journal_entry_items_accounts_receivable",
-  "outbound_delivery_headers",
-  "outbound_delivery_items",
-  "payments_accounts_receivable",
-  "plants",
-  "products",
-  "product_descriptions",
-  "product_plants",
-  "product_storage_locations",
-  "sales_order_headers",
-  "sales_order_items",
-  "sales_order_schedule_lines"
-] as const;
 
 const COLORS: Record<NodeKind, string> = {
   customer: "#0f766e",
@@ -128,9 +104,10 @@ const EXAMPLE_PROMPTS = [
 ];
 
 export async function buildDataModel(rootDirectory: string): Promise<DataModel> {
-  const dataDirectory = resolveDataDirectory(rootDirectory);
-  const raw = loadRawDatasets(dataDirectory);
-  const db = await buildDatabase(raw);
+  const persistent = await initializePersistentDatabase(rootDirectory);
+  const { loadRawDatasets } = await import('../storage/dataset-catalog.js');
+  const raw = loadRawDatasets(persistent.dataDirectory);
+  const db = persistent.db;
   const graphContext = buildGraph(raw);
   const analytics = buildAnalyticsSummary(db, graphContext.lookup);
 
@@ -148,481 +125,15 @@ export async function buildDataModel(rootDirectory: string): Promise<DataModel> 
     allEdges: graphContext.allEdges,
     adjacency: graphContext.adjacency,
     expansions: graphContext.expansions,
-    schemaSummary: buildSchemaSummary(),
+    semanticCatalog: persistent.semanticCatalog,
+    schemaSummary: persistent.schemaSummary,
     examplePrompts: EXAMPLE_PROMPTS,
     lookup: graphContext.lookup
   };
 }
 
-function resolveDataDirectory(rootDirectory: string): string {
-  const extractedPath = path.join(rootDirectory, "data", "sap-o2c-data");
-  if (!fs.existsSync(extractedPath)) {
-    throw new Error(
-      `Dataset directory not found at ${extractedPath}. Extract sap-order-to-cash-dataset.zip first.`
-    );
-  }
-
-  return extractedPath;
-}
-
-function loadRawDatasets(dataDirectory: string): RawDatasets {
-  const datasets: RawDatasets = {};
-  for (const name of DATASET_NAMES) {
-    datasets[name] = readJsonlDirectory(path.join(dataDirectory, name));
-  }
-  return datasets;
-}
-
-async function buildDatabase(raw: RawDatasets): Promise<Database> {
-  const SQL = await initSqlJs({
-    locateFile: (file: string) =>
-      path.join(process.cwd(), "node_modules", "sql.js", "dist", file)
-  });
-
-  const db = new SQL.Database();
-  for (const [tableName, rows] of Object.entries(raw)) {
-    createRawTable(db, tableName, rows);
-  }
-  createAnalyticsViews(db);
-  return db;
-}
-
-function createRawTable(db: Database, tableName: string, rows: Row[]): void {
-  const columns = Array.from(
-    new Set(rows.flatMap((row) => Object.keys(row)))
-  );
-
-  if (columns.length === 0) {
-    db.run(`CREATE TABLE "${tableName}" ("_empty" TEXT)`);
-    return;
-  }
-
-  const columnSql = columns.map((column) => `"${column}" TEXT`).join(", ");
-  db.run(`CREATE TABLE "${tableName}" (${columnSql})`);
-
-  const insertSql = `INSERT INTO "${tableName}" (${columns
-    .map((column) => `"${column}"`)
-    .join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`;
-  const statement = db.prepare(insertSql);
-
-  for (const row of rows) {
-    statement.run(columns.map((column) => toDbValue(row[column])));
-  }
-
-  statement.free();
-}
-
-function createAnalyticsViews(db: Database): void {
-  db.run(`
-    CREATE VIEW v_customer_master AS
-    SELECT
-      bp.customer AS customer_id,
-      bp.businessPartner AS business_partner_id,
-      COALESCE(NULLIF(bp.businessPartnerFullName, ''), NULLIF(bp.businessPartnerName, ''), NULLIF(bp.organizationBpName1, ''), bp.customer) AS customer_name,
-      addr.addressId AS address_id,
-      addr.cityName AS city,
-      addr.region AS region,
-      addr.country AS country,
-      addr.postalCode AS postal_code,
-      addr.streetName AS street_name,
-      cca.companyCode AS company_code,
-      cca.paymentTerms AS company_payment_terms,
-      cca.reconciliationAccount AS reconciliation_account,
-      csa.salesOrganization AS sales_organization,
-      csa.distributionChannel AS distribution_channel,
-      csa.division AS division,
-      csa.salesOffice AS sales_office,
-      csa.salesGroup AS sales_group,
-      csa.supplyingPlant AS supplying_plant,
-      csa.currency AS sales_currency
-    FROM business_partners bp
-    LEFT JOIN business_partner_addresses addr
-      ON addr.businessPartner = bp.businessPartner
-    LEFT JOIN customer_company_assignments cca
-      ON cca.customer = bp.customer
-    LEFT JOIN customer_sales_area_assignments csa
-      ON csa.customer = bp.customer;
-  `);
-
-  db.run(`
-    CREATE VIEW v_product_master AS
-    SELECT
-      p.product AS product_id,
-      COALESCE(pd.productDescription, p.productOldId, p.product) AS product_description,
-      p.productType AS product_type,
-      p.productGroup AS product_group,
-      p.baseUnit AS base_unit,
-      p.division AS division,
-      (
-        SELECT COUNT(DISTINCT pp.plant)
-        FROM product_plants pp
-        WHERE pp.product = p.product
-      ) AS plant_count,
-      (
-        SELECT COUNT(*)
-        FROM product_storage_locations psl
-        WHERE psl.product = p.product
-      ) AS storage_location_count
-    FROM products p
-    LEFT JOIN product_descriptions pd
-      ON pd.product = p.product
-     AND pd.language = 'EN';
-  `);
-
-  db.run(`
-    CREATE VIEW v_payment_documents AS
-    SELECT
-      companyCode AS company_code,
-      clearingDocFiscalYear AS fiscal_year,
-      clearingAccountingDocument AS payment_document,
-      MIN(clearingDate) AS clearing_date,
-      MAX(customer) AS customer_id,
-      COUNT(DISTINCT accountingDocument) AS source_document_count,
-      SUM(CASE WHEN accountingDocument = clearingAccountingDocument THEN 1 ELSE 0 END) AS payment_self_rows
-    FROM payments_accounts_receivable
-    WHERE NULLIF(clearingAccountingDocument, '') IS NOT NULL
-      AND NULLIF(clearingAccountingDocument, '0') IS NOT NULL
-      AND NULLIF(clearingDocFiscalYear, '0') IS NOT NULL
-    GROUP BY companyCode, clearingDocFiscalYear, clearingAccountingDocument;
-  `);
-
-  db.run(`
-    CREATE VIEW v_sales_flow AS
-    SELECT
-      soh.salesOrder AS sales_order,
-      printf('%06d', CAST(soi.salesOrderItem AS INTEGER)) AS sales_order_item,
-      CAST(soi.salesOrderItem AS INTEGER) AS sales_order_item_number,
-      soh.salesOrderType AS sales_order_type,
-      soh.creationDate AS sales_order_created_at,
-      soh.requestedDeliveryDate AS requested_delivery_date,
-      soh.totalNetAmount AS sales_order_total_net_amount,
-      soh.transactionCurrency AS order_currency,
-      soh.overallDeliveryStatus AS overall_delivery_status,
-      soh.overallOrdReltdBillgStatus AS overall_billing_status,
-      soh.soldToParty AS customer_id,
-      cm.customer_name AS customer_name,
-      soi.material AS product_id,
-      pm.product_description AS product_description,
-      soi.requestedQuantity AS requested_quantity,
-      soi.requestedQuantityUnit AS requested_quantity_unit,
-      soi.netAmount AS sales_order_item_net_amount,
-      soi.productionPlant AS production_plant,
-      soi.storageLocation AS order_storage_location,
-      odl.deliveryDocument AS delivery_document,
-      printf('%06d', CAST(odl.deliveryDocumentItem AS INTEGER)) AS delivery_item,
-      odh.creationDate AS delivery_created_at,
-      odl.actualDeliveryQuantity AS delivery_quantity,
-      odl.deliveryQuantityUnit AS delivery_quantity_unit,
-      odl.plant AS delivery_plant,
-      odl.storageLocation AS delivery_storage_location,
-      odh.shippingPoint AS shipping_point,
-      odh.overallGoodsMovementStatus AS goods_movement_status,
-      odh.overallPickingStatus AS picking_status,
-      bdi.billingDocument AS billing_document,
-      printf('%06d', CAST(bdi.billingDocumentItem AS INTEGER)) AS billing_item,
-      bdh.billingDocumentDate AS billing_date,
-      bdh.billingDocumentType AS billing_document_type,
-      bdh.totalNetAmount AS billing_total_net_amount,
-      bdi.netAmount AS billing_item_net_amount,
-      bdi.billingQuantity AS billing_quantity,
-      bdi.billingQuantityUnit AS billing_quantity_unit,
-      bdh.transactionCurrency AS billing_currency,
-      COALESCE(bcan.billingDocumentIsCancelled, bdh.billingDocumentIsCancelled) AS billing_cancelled,
-      bdh.companyCode AS company_code,
-      bdh.fiscalYear AS fiscal_year,
-      bdh.accountingDocument AS accounting_document,
-      jei.referenceDocument AS journal_reference_document,
-      jei.postingDate AS journal_posting_date,
-      jei.clearingAccountingDocument AS clearing_accounting_document,
-      jei.clearingDate AS clearing_date,
-      pay.payment_document AS payment_document,
-      pay.clearing_date AS payment_clearing_date,
-      CASE
-        WHEN odl.deliveryDocument IS NULL THEN 'ORDERED_NOT_DELIVERED'
-        WHEN bdi.billingDocument IS NULL THEN 'DELIVERED_NOT_BILLED'
-        WHEN jei.accountingDocument IS NULL THEN 'BILLED_NOT_POSTED'
-        WHEN pay.payment_document IS NULL THEN 'BILLED_NOT_PAID'
-        ELSE 'PAID'
-      END AS flow_status
-    FROM sales_order_items soi
-    JOIN sales_order_headers soh
-      ON soh.salesOrder = soi.salesOrder
-    LEFT JOIN v_customer_master cm
-      ON cm.customer_id = soh.soldToParty
-    LEFT JOIN v_product_master pm
-      ON pm.product_id = soi.material
-    LEFT JOIN outbound_delivery_items odl
-      ON odl.referenceSdDocument = soi.salesOrder
-     AND CAST(odl.referenceSdDocumentItem AS INTEGER) = CAST(soi.salesOrderItem AS INTEGER)
-    LEFT JOIN outbound_delivery_headers odh
-      ON odh.deliveryDocument = odl.deliveryDocument
-    LEFT JOIN billing_document_items bdi
-      ON bdi.referenceSdDocument = odl.deliveryDocument
-     AND CAST(bdi.referenceSdDocumentItem AS INTEGER) = CAST(odl.deliveryDocumentItem AS INTEGER)
-    LEFT JOIN billing_document_headers bdh
-      ON bdh.billingDocument = bdi.billingDocument
-    LEFT JOIN billing_document_cancellations bcan
-      ON bcan.billingDocument = bdh.billingDocument
-    LEFT JOIN journal_entry_items_accounts_receivable jei
-      ON jei.companyCode = bdh.companyCode
-     AND jei.fiscalYear = bdh.fiscalYear
-     AND jei.accountingDocument = bdh.accountingDocument
-    LEFT JOIN v_payment_documents pay
-      ON pay.company_code = jei.companyCode
-     AND pay.fiscal_year = jei.clearingDocFiscalYear
-     AND pay.payment_document = jei.clearingAccountingDocument;
-  `);
-
-  db.run(`
-    CREATE VIEW v_billing_flow AS
-    SELECT DISTINCT
-      bdh.billingDocument AS billing_document,
-      printf('%06d', CAST(bdi.billingDocumentItem AS INTEGER)) AS billing_item,
-      bdh.billingDocumentType AS billing_document_type,
-      bdh.billingDocumentDate AS billing_date,
-      bdh.soldToParty AS customer_id,
-      cm.customer_name AS customer_name,
-      bdi.material AS product_id,
-      pm.product_description AS product_description,
-      bdi.referenceSdDocument AS delivery_document,
-      printf('%06d', CAST(bdi.referenceSdDocumentItem AS INTEGER)) AS delivery_item,
-      odi.referenceSdDocument AS sales_order,
-      printf('%06d', CAST(odi.referenceSdDocumentItem AS INTEGER)) AS sales_order_item,
-      bdh.companyCode AS company_code,
-      bdh.fiscalYear AS fiscal_year,
-      bdh.accountingDocument AS accounting_document,
-      jei.postingDate AS journal_posting_date,
-      jei.clearingAccountingDocument AS clearing_accounting_document,
-      pay.payment_document AS payment_document,
-      pay.clearing_date AS payment_clearing_date,
-      COALESCE(bcan.billingDocumentIsCancelled, bdh.billingDocumentIsCancelled) AS billing_cancelled,
-      bdh.totalNetAmount AS billing_total_net_amount,
-      bdi.netAmount AS billing_item_net_amount
-    FROM billing_document_headers bdh
-    LEFT JOIN billing_document_items bdi
-      ON bdi.billingDocument = bdh.billingDocument
-    LEFT JOIN outbound_delivery_items odi
-      ON odi.deliveryDocument = bdi.referenceSdDocument
-     AND CAST(odi.deliveryDocumentItem AS INTEGER) = CAST(bdi.referenceSdDocumentItem AS INTEGER)
-    LEFT JOIN v_customer_master cm
-      ON cm.customer_id = bdh.soldToParty
-    LEFT JOIN v_product_master pm
-      ON pm.product_id = bdi.material
-    LEFT JOIN billing_document_cancellations bcan
-      ON bcan.billingDocument = bdh.billingDocument
-    LEFT JOIN journal_entry_items_accounts_receivable jei
-      ON jei.companyCode = bdh.companyCode
-     AND jei.fiscalYear = bdh.fiscalYear
-     AND jei.accountingDocument = bdh.accountingDocument
-    LEFT JOIN v_payment_documents pay
-      ON pay.company_code = jei.companyCode
-     AND pay.fiscal_year = jei.clearingDocFiscalYear
-     AND pay.payment_document = jei.clearingAccountingDocument;
-  `);
-
-  db.run(`
-    CREATE VIEW v_product_billing_stats AS
-    SELECT
-      product_id,
-      product_description,
-      COUNT(DISTINCT billing_document) AS billing_document_count,
-      COUNT(*) AS billed_line_count,
-      ROUND(SUM(CAST(billing_item_net_amount AS REAL)), 2) AS total_billed_amount
-    FROM v_sales_flow
-    WHERE billing_document IS NOT NULL
-    GROUP BY product_id, product_description;
-  `);
-
-  db.run(`
-    CREATE VIEW v_customer_revenue_stats AS
-    SELECT
-      customer_id,
-      customer_name,
-      COUNT(DISTINCT billing_document) AS billing_document_count,
-      ROUND(SUM(CAST(billing_item_net_amount AS REAL)), 2) AS total_billed_amount,
-      COUNT(DISTINCT CASE
-        WHEN payment_document IS NULL
-         AND journal_reference_document IS NOT NULL
-         AND CAST(COALESCE(billing_cancelled, '0') AS INTEGER) = 0
-        THEN billing_document
-      END) AS open_billing_documents
-    FROM v_sales_flow
-    WHERE billing_document IS NOT NULL
-    GROUP BY customer_id, customer_name;
-  `);
-
-  db.run(`
-    CREATE VIEW v_document_links AS
-    SELECT DISTINCT
-      'customer' AS source_kind,
-      customer_id AS source_id,
-      'sales-order' AS target_kind,
-      sales_order AS target_id,
-      'placed-order' AS relation
-    FROM v_sales_flow
-    WHERE customer_id IS NOT NULL
-      AND sales_order IS NOT NULL
-
-    UNION ALL
-
-    SELECT DISTINCT
-      'sales-order',
-      sales_order,
-      'delivery',
-      delivery_document,
-      'fulfilled-by'
-    FROM v_sales_flow
-    WHERE sales_order IS NOT NULL
-      AND delivery_document IS NOT NULL
-
-    UNION ALL
-
-    SELECT DISTINCT
-      'delivery',
-      delivery_document,
-      'billing-document',
-      billing_document,
-      'billed-by'
-    FROM v_sales_flow
-    WHERE delivery_document IS NOT NULL
-      AND billing_document IS NOT NULL
-
-    UNION ALL
-
-    SELECT DISTINCT
-      'billing-document',
-      billing_document,
-      'journal-entry',
-      accounting_document,
-      'posted-to'
-    FROM v_sales_flow
-    WHERE billing_document IS NOT NULL
-      AND journal_reference_document IS NOT NULL
-
-    UNION ALL
-
-    SELECT DISTINCT
-      'journal-entry',
-      accounting_document,
-      'payment',
-      payment_document,
-      'cleared-by'
-    FROM v_sales_flow
-    WHERE journal_reference_document IS NOT NULL
-      AND payment_document IS NOT NULL;
-  `);
-
-  db.run(`
-    CREATE VIEW v_flow_anomalies AS
-    SELECT DISTINCT
-      'DELIVERED_NOT_BILLED' AS anomaly_type,
-      sales_order,
-      sales_order_item,
-      delivery_document,
-      delivery_item,
-      NULL AS billing_document,
-      NULL AS accounting_document,
-      customer_id,
-      customer_name,
-      product_id,
-      product_description,
-      'Delivery exists but no downstream billing document was found.' AS detail
-    FROM v_sales_flow
-    WHERE delivery_document IS NOT NULL
-      AND billing_document IS NULL
-
-    UNION ALL
-
-    SELECT DISTINCT
-      'BILLED_WITHOUT_DELIVERY' AS anomaly_type,
-      odi.referenceSdDocument AS sales_order,
-      printf('%06d', CAST(odi.referenceSdDocumentItem AS INTEGER)) AS sales_order_item,
-      NULL AS delivery_document,
-      NULL AS delivery_item,
-      bdi.billingDocument AS billing_document,
-      bdh.accountingDocument AS accounting_document,
-      bdh.soldToParty AS customer_id,
-      cm.customer_name AS customer_name,
-      bdi.material AS product_id,
-      pm.product_description AS product_description,
-      'Billing document item could not be matched back to an outbound delivery item.' AS detail
-    FROM billing_document_items bdi
-    JOIN billing_document_headers bdh
-      ON bdh.billingDocument = bdi.billingDocument
-    LEFT JOIN outbound_delivery_items odi
-      ON odi.deliveryDocument = bdi.referenceSdDocument
-     AND CAST(odi.deliveryDocumentItem AS INTEGER) = CAST(bdi.referenceSdDocumentItem AS INTEGER)
-    LEFT JOIN v_customer_master cm
-      ON cm.customer_id = bdh.soldToParty
-    LEFT JOIN v_product_master pm
-      ON pm.product_id = bdi.material
-    WHERE odi.deliveryDocument IS NULL
-
-    UNION ALL
-
-    SELECT DISTINCT
-      'BILLED_NOT_PAID' AS anomaly_type,
-      sales_order,
-      sales_order_item,
-      delivery_document,
-      delivery_item,
-      billing_document,
-      accounting_document,
-      customer_id,
-      customer_name,
-      product_id,
-      product_description,
-      'Billing is posted but the clearing payment document is still missing.' AS detail
-    FROM v_sales_flow
-    WHERE billing_document IS NOT NULL
-      AND journal_reference_document IS NOT NULL
-      AND payment_document IS NULL
-      AND CAST(COALESCE(billing_cancelled, '0') AS INTEGER) = 0
-
-    UNION ALL
-
-    SELECT DISTINCT
-      'CANCELLED_BILLING' AS anomaly_type,
-      sales_order,
-      sales_order_item,
-      delivery_document,
-      delivery_item,
-      billing_document,
-      accounting_document,
-      customer_id,
-      customer_name,
-      product_id,
-      product_description,
-      'Billing document is flagged as cancelled in the cancellation dataset.' AS detail
-    FROM v_sales_flow
-    WHERE billing_document IS NOT NULL
-      AND CAST(COALESCE(billing_cancelled, '0') AS INTEGER) = 1;
-  `);
-}
-
-function buildSchemaSummary(): string {
-  return [
-    "Primary business views:",
-    "- v_sales_flow: one row per sales order item with downstream delivery, billing, journal entry, and payment columns.",
-    "- v_billing_flow: billing-centric trace view from billing document to delivery, sales order, accounting, and payment.",
-    "- v_product_billing_stats: product billing rollup with billing_document_count and total_billed_amount.",
-    "- v_customer_revenue_stats: billed revenue, billing-document coverage, and open receivables by customer.",
-    "- v_document_links: graph-style source/target links across customer, order, delivery, billing, journal, and payment documents.",
-    "- v_flow_anomalies: anomaly_type, sales_order, delivery_document, billing_document, accounting_document, customer, product, detail.",
-    "- v_customer_master: customer, address, company assignment, and sales area attributes.",
-    "- v_product_master: product master plus description, plant_count, and storage_location_count.",
-    "",
-    "Raw tables available when needed:",
-    DATASET_NAMES.map((name) => `- ${name}`).join("\n"),
-    "",
-    "Guardrails:",
-    "- Only SELECT or CTE-based read queries are allowed.",
-    "- Prefer v_sales_flow, v_billing_flow, v_product_billing_stats, and v_flow_anomalies for analyst questions."
-  ].join("\n");
-}
-
 function buildAnalyticsSummary(
-  db: Database,
+  db: SqliteDatabase,
   lookup: DataModel["lookup"]
 ): AnalyticsSummary {
   const flowBreakdown = executeRows(
@@ -751,15 +262,13 @@ function buildAnalyticsSummary(
   };
 }
 
-function executeRows(db: Database, sql: string): Array<Record<string, JsonValue>> {
-  const result = db.exec(sql)[0];
-  if (!result) {
-    return [];
-  }
-
-  return result.values.map((valueRow) =>
+function executeRows(
+  db: SqliteDatabase,
+  sql: string
+): Array<Record<string, JsonValue>> {
+  return executeQuery(db, sql).rows.map((row) =>
     Object.fromEntries(
-      valueRow.map((value, index) => [result.columns[index], toMetadataValue(value)])
+      Object.entries(row).map(([key, value]) => [key, toMetadataValue(value)])
     )
   );
 }
@@ -1561,3 +1070,6 @@ function pushGenericLookup(
     lookup.set(key, values);
   }
 }
+
+
+

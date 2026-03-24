@@ -11,7 +11,7 @@ An evaluator-ready graph-based data modeling and query system for the provided S
 - Deterministic fast-path rules for high-value document-flow questions
 - Streaming query UX with visible plan, SQL, row preview, and grounded final answer
 - Analytics layer with process-health metrics, anomaly spotlights, top products, and top customers
-- Policy-driven privacy guardrails with curated-source enforcement, exfiltration blocking, and sensitive-field redaction
+- Policy-driven privacy guardrails with LLM intent classification, AST SQL validation, exfiltration blocking, and sensitive-field protection
 - Model-provider abstraction so the LLM layer can evolve without rewriting graph or safety logic
 - Dataset verification script for key evaluator questions
 - AI session log artifact for submission packaging
@@ -20,14 +20,15 @@ An evaluator-ready graph-based data modeling and query system for the provided S
 
 ### 1. Storage Choice
 
-The app uses **in-memory SQLite via `sql.js`**.
+The app uses a **persistent SQLite semantic store via `better-sqlite3`**.
 
 Why this choice:
 
-- The dataset is small enough to ingest quickly at startup
-- SQLite gives a strong tabular reasoning layer for LLM-generated SQL
-- `sql.js` avoids native database setup and keeps the project portable
-- The graph and SQL layers are built from the same normalized source, which reduces model drift
+- The raw JSONL dataset is ingested into `generated/o2c.sqlite` and reused across restarts
+- SQLite gives a strong local analytical layer for LLM-generated SQL without requiring an external service
+- A file-backed store is more realistic and future-adaptive than rebuilding an in-memory database on every boot
+- The graph and SQL layers are built from the same curated semantic layer, which reduces model drift
+- Manifest-based rebuilds keep the database synchronized with dataset changes
 
 ### 2. Data Model
 
@@ -86,41 +87,46 @@ This keeps the canvas readable while still using the full dataset.
 
 ### 4. Query Pipeline
 
-The query system is hybrid:
+The query system is hybrid and layered:
 
-1. Guardrail checks whether the prompt is about the provided dataset
+1. Deterministic + LLM-assisted classification checks whether the prompt is about the provided dataset
 2. Rule planner handles common high-confidence business questions
 3. Gemini generates SQL for broader natural-language analysis
-4. SQL is validated to allow only read-only queries
-5. SQL is executed against curated views
-6. The result is summarized in natural language
-7. Relevant graph nodes and edges are highlighted in the UI
+4. SQL is validated with an AST parser against the curated semantic layer
+5. If the generated SQL fails validation or execution, the system performs one repair pass automatically
+6. SQL is executed against persistent curated views
+7. The result is summarized in natural language
+8. Relevant graph nodes and edges are highlighted in the UI
 
 ## LLM Prompting Strategy
 
-The LLM is not pointed at raw tables first. It is guided toward curated views with explicit instructions to:
+The LLM is not pointed at raw tables first. It is guided toward a targeted subset of curated views with explicit instructions to:
 
 - stay within the dataset
 - use SQLite-compatible `SELECT` or `WITH` queries only
-- prefer `v_sales_flow`, `v_billing_flow`, `v_product_billing_stats`, `v_customer_revenue_stats`, and `v_flow_anomalies`
+- use curated views only and never raw staging tables
 - limit result size
+- avoid restricted address/contact columns
 - reject off-topic prompts
 
-This reduces hallucinated joins and makes generated SQL more stable.
+This reduces hallucinated joins, shrinks prompt context, and makes generated SQL more stable.
 
 ## Guardrails
 
 Guardrails operate at multiple layers:
 
 - Domain keyword and business-ID checks
+- Optional LLM intent classification for safety routing
 - Off-topic rejection for irrelevant prompts
 - Bulk extraction and dataset-dump rejection
-- SQL validation blocking non-read operations
-- Curated-view allowlists
+- AST-based SQL validation blocking non-read operations
+- Curated-view allowlists enforced at parse time
 - `SELECT *` blocking
+- restricted address/contact column blocking even through aliases
 - policy-based row caps
 - sensitive-field redaction in privacy-sensitive queries
 - Curated-view-first prompting
+- single-retry healing loop for bad generated SQL
 - Result-grounded answer generation only after execution
 
 Example rejection:
@@ -137,17 +143,37 @@ Example rejection:
 - Analytics summary cards and risk spotlights
 - Node-family filters for graph decluttering
 - SQL evidence preview in chat
+- Persistent semantic store with rebuild-on-change ingestion
+- Automatic SQL repair after execution failures
 
 ## Project Structure
 
 - `src/server/services/data-model.ts`
-  Graph construction, curated SQLite views, analytics summary, graph search
+  Graph construction, analytics summary, graph search, and node details
 
 - `src/server/services/query-service.ts`
-  Hybrid rule + Gemini query planner, SQL execution, streamed query events
+  Public query entrypoints
+
+- `src/server/services/query-runtime.ts`
+  Hybrid rule + Gemini orchestration, SQL healing loop, streamed query events
+
+- `src/server/services/rule-planner.ts`
+  Deterministic evaluator-grade question routing and summaries
+
+- `src/server/services/question-classifier.ts`
+  Deterministic + LLM-assisted intent and extraction-risk routing
 
 - `src/server/services/guardrails.ts`
-  Prompt-domain checks and SQL safety validation
+  Prompt-domain checks and AST SQL policy validation
+
+- `src/server/storage/persistent-database.ts`
+  Persistent SQLite build/rebuild, query execution, metadata tracking
+
+- `src/server/storage/semantic-layer.ts`
+  Curated analytical views, indexes, semantic catalog, and schema summaries
+
+- `src/server/storage/dataset-catalog.ts`
+  Dataset discovery, manifest hashing, and raw JSONL loading
 
 - `src/client/App.tsx`
   App-level state for graph, streaming chat, search, filters, and highlights

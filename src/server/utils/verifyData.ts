@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import type { Database } from "sql.js";
+import { executeQuery } from "../storage/persistent-database.js";
+import type { SqliteDatabase } from "../storage/semantic-layer.js";
 import { buildDataModel } from "../services/data-model.js";
 
 async function main() {
@@ -54,17 +55,11 @@ async function main() {
   );
 }
 
-function execSingle(db: Database, sql: string): Array<Record<string, unknown>> {
-  const result = db.exec(sql)[0];
-  if (!result) {
-    return [];
-  }
-
-  return result.values.map((row: unknown[]) =>
-    Object.fromEntries(
-      row.map((value, index) => [result.columns[index], value])
-    )
-  );
+function execSingle(
+  db: SqliteDatabase,
+  sql: string
+): Array<Record<string, unknown>> {
+  return executeQuery(db, sql).rows as Array<Record<string, unknown>>;
 }
 
 main().catch((error) => {

@@ -1,4 +1,10 @@
+import NodeSqlParser from "node-sql-parser";
+import type { AST, Select } from "node-sql-parser";
 import type { JsonValue } from "../../shared/types.js";
+import {
+  RESTRICTED_COLUMN_NAMES,
+  type SemanticCatalog
+} from "../storage/semantic-layer.js";
 import type { DataModel } from "./data-model.js";
 import {
   DATA_EXFILTRATION_PATTERNS,
@@ -6,10 +12,12 @@ import {
   GOVERNANCE_SUMMARY,
   maskSensitiveValue,
   PRIVACY_SENSITIVE_PROMPT_PATTERNS,
-  SELECT_STAR_SQL,
   SENSITIVE_COLUMNS,
   type GuardrailDecision
 } from "./governance.js";
+
+const { Parser } = NodeSqlParser;
+const parser = new Parser();
 
 const DOMAIN_KEYWORDS = [
   "order",
@@ -28,7 +36,9 @@ const DOMAIN_KEYWORDS = [
   "document",
   "revenue",
   "billing document",
-  "outbound delivery"
+  "outbound delivery",
+  "receivable",
+  "fulfillment"
 ];
 
 const OFF_TOPIC_KEYWORDS = [
@@ -43,8 +53,26 @@ const OFF_TOPIC_KEYWORDS = [
   "sports",
   "vacation",
   "translate",
-  "write me"
+  "write me",
+  "essay",
+  "song",
+  "startup idea"
 ];
+
+const BULK_EXPORT_PATTERNS = [
+  /\b(comprehensive|complete|full|entire|whole)\s+(overview|list|table|dump|extract)\b/i,
+  /\b(all|every|entirety of)\s+(customers|addresses|contacts|rows|records)\b/i,
+  /\btabular overview\b/i
+];
+
+export interface SqlValidationResult {
+  valid: boolean;
+  reason?: string;
+  notes: string[];
+  sources: string[];
+  declaredLimit: number | null;
+  restrictedColumns: string[];
+}
 
 export function evaluateQuestionDomain(
   question: string,
@@ -87,7 +115,10 @@ export function evaluateQuestionDomain(
     };
   }
 
-  if (DATA_EXFILTRATION_PATTERNS.some((pattern) => pattern.test(question))) {
+  if (
+    DATA_EXFILTRATION_PATTERNS.some((pattern) => pattern.test(question)) ||
+    BULK_EXPORT_PATTERNS.some((pattern) => pattern.test(question))
+  ) {
     return {
       allowed: false,
       reason:
@@ -110,7 +141,7 @@ export function evaluateQuestionDomain(
   }
 
   notes.push(
-    `Query policy ${GOVERNANCE_SUMMARY.policyVersion} is enforcing curated-source and read-only constraints.`
+    `Query policy ${GOVERNANCE_SUMMARY.policyVersion} is enforcing curated-source and AST-validated read-only constraints.`
   );
 
   return {
@@ -138,20 +169,31 @@ export function normalizeSql(sql: string): string {
 
 export function validateReadOnlySql(
   sql: string,
+  semanticCatalog: SemanticCatalog,
   options?: { maxRows?: number }
-): { valid: boolean; reason?: string; notes: string[] } {
+): SqlValidationResult {
   const normalized = normalizeSql(sql);
   const notes: string[] = [];
 
   if (!normalized) {
-    return { valid: false, reason: "No SQL was generated.", notes };
+    return {
+      valid: false,
+      reason: "No SQL was generated.",
+      notes,
+      sources: [],
+      declaredLimit: null,
+      restrictedColumns: []
+    };
   }
 
   if (FORBIDDEN_SQL.test(normalized)) {
     return {
       valid: false,
       reason: "Only read-only SQL is allowed.",
-      notes
+      notes,
+      sources: [],
+      declaredLimit: null,
+      restrictedColumns: []
     };
   }
 
@@ -159,7 +201,10 @@ export function validateReadOnlySql(
     return {
       valid: false,
       reason: "SQL must start with SELECT or WITH.",
-      notes
+      notes,
+      sources: [],
+      declaredLimit: null,
+      restrictedColumns: []
     };
   }
 
@@ -167,46 +212,108 @@ export function validateReadOnlySql(
     return {
       valid: false,
       reason: "Multiple SQL statements are not allowed.",
-      notes
+      notes,
+      sources: [],
+      declaredLimit: null,
+      restrictedColumns: []
     };
   }
 
-  if (SELECT_STAR_SQL.test(normalized)) {
+  let ast: AST | AST[];
+  try {
+    ast = parser.astify(normalized, { database: "sqlite" });
+  } catch (error) {
     return {
       valid: false,
-      reason: "SELECT * is not allowed. Queries must project explicit columns.",
-      notes
+      reason:
+        error instanceof Error ? `SQL could not be parsed safely. ${error.message}` : "SQL could not be parsed safely.",
+      notes,
+      sources: [],
+      declaredLimit: null,
+      restrictedColumns: []
     };
   }
 
-  const sources = extractReferencedSources(normalized);
-  const cteNames = extractCteNames(normalized);
-  const disallowedSources = sources.filter(
-    (source) =>
-      !GOVERNANCE_SUMMARY.curatedQuerySources.includes(source) &&
-      !cteNames.has(source)
-  );
-  if (disallowedSources.length > 0) {
+  const statements = Array.isArray(ast) ? ast : [ast];
+  if (statements.length !== 1) {
     return {
       valid: false,
-      reason: `Query references non-curated sources: ${disallowedSources.join(", ")}.`,
-      notes
+      reason: "Exactly one SQL statement is allowed.",
+      notes,
+      sources: [],
+      declaredLimit: null,
+      restrictedColumns: []
     };
   }
 
-  const declaredLimit = extractSqlLimit(normalized);
-  if (options?.maxRows && declaredLimit !== null && declaredLimit > options.maxRows) {
+  const statement = statements[0];
+  if (statement.type !== "select") {
     return {
       valid: false,
-      reason: `Query limit ${declaredLimit} exceeds the policy maximum of ${options.maxRows}.`,
-      notes
+      reason: "Only SELECT statements are allowed.",
+      notes,
+      sources: [],
+      declaredLimit: null,
+      restrictedColumns: []
+    };
+  }
+
+  const context: ValidationContext = {
+    semanticCatalog,
+    sourceNames: new Set<string>(),
+    restrictedColumns: new Set<string>(),
+    declaredLimit: extractLimitValue(statement),
+    notes,
+    cteNames: new Set<string>()
+  };
+
+  try {
+    validateSelectStatement(statement, context);
+  } catch (error) {
+    return {
+      valid: false,
+      reason: error instanceof Error ? error.message : "SQL validation failed.",
+      notes,
+      sources: Array.from(context.sourceNames),
+      declaredLimit: context.declaredLimit,
+      restrictedColumns: Array.from(context.restrictedColumns)
+    };
+  }
+
+  if (context.restrictedColumns.size > 0) {
+    const restrictedColumns = Array.from(context.restrictedColumns).sort();
+    return {
+      valid: false,
+      reason: `Query references restricted columns: ${restrictedColumns.join(", ")}.`,
+      notes,
+      sources: Array.from(context.sourceNames),
+      declaredLimit: context.declaredLimit,
+      restrictedColumns
+    };
+  }
+
+  if (options?.maxRows && context.declaredLimit !== null && context.declaredLimit > options.maxRows) {
+    return {
+      valid: false,
+      reason: `Query limit ${context.declaredLimit} exceeds the policy maximum of ${options.maxRows}.`,
+      notes,
+      sources: Array.from(context.sourceNames),
+      declaredLimit: context.declaredLimit,
+      restrictedColumns: []
     };
   }
 
   notes.push(
-    `Validated curated-source allowlist across: ${sources.length > 0 ? sources.join(", ") : "no explicit sources detected"}.`
+    `Validated curated-source allowlist across: ${Array.from(context.sourceNames).join(", ")}.`
   );
-  return { valid: true, notes };
+
+  return {
+    valid: true,
+    notes,
+    sources: Array.from(context.sourceNames),
+    declaredLimit: context.declaredLimit,
+    restrictedColumns: []
+  };
 }
 
 export function ensureLimit(sql: string, limit = 50): string {
@@ -243,15 +350,17 @@ export function sanitizeQueryResult(
   }
 
   if (decision.redactSensitiveFields) {
-    const intersectingColumns = columns.filter((column) =>
-      SENSITIVE_COLUMNS.has(column)
+    const intersectingColumns = columns.filter(
+      (column) => SENSITIVE_COLUMNS.has(column) || RESTRICTED_COLUMN_NAMES.has(column)
     );
     if (intersectingColumns.length > 0) {
       sanitizedRows = truncatedRows.map((row) =>
         Object.fromEntries(
           Object.entries(row).map(([key, value]) => [
             key,
-            SENSITIVE_COLUMNS.has(key) ? maskSensitiveValue(key, value) : value
+            SENSITIVE_COLUMNS.has(key) || RESTRICTED_COLUMN_NAMES.has(key)
+              ? maskSensitiveValue(key, value)
+              : value
           ])
         )
       );
@@ -268,25 +377,252 @@ export function sanitizeQueryResult(
   };
 }
 
-function extractReferencedSources(sql: string): string[] {
-  const sources = new Set<string>();
-  const regex = /\b(?:from|join)\s+([a-zA-Z_][\w]*)/gi;
-  for (const match of sql.matchAll(regex)) {
-    const source = match[1];
-    if (source && !source.startsWith("select")) {
-      sources.add(source);
+type ValidationContext = {
+  semanticCatalog: SemanticCatalog;
+  sourceNames: Set<string>;
+  restrictedColumns: Set<string>;
+  declaredLimit: number | null;
+  notes: string[];
+  cteNames: Set<string>;
+};
+
+function validateSelectStatement(
+  select: Select,
+  context: ValidationContext,
+  inheritedCtes?: Set<string>
+): void {
+  const cteNames = new Set(inheritedCtes ?? []);
+  if (select.with) {
+    for (const cte of select.with) {
+      const cteName = cte.name.value;
+      cteNames.add(cteName);
+      context.cteNames.add(cteName);
+      validateSelectStatement(cte.stmt.ast, context, cteNames);
     }
   }
-  return Array.from(sources);
+
+  const scopeSources = buildScopeSources(select, context, cteNames);
+  if (scopeSources.curatedSources.size === 0 && scopeSources.cteSources.size === 0) {
+    throw new Error(
+      "Query must reference at least one curated semantic-layer source."
+    );
+  }
+  for (const column of select.columns ?? []) {
+    const expression = typeof column === "object" && "expr" in column ? column.expr : column;
+    if (isSelectStar(expression)) {
+      throw new Error(
+        "SELECT * is not allowed. Queries must project explicit columns."
+      );
+    }
+    inspectExpression(expression, scopeSources, context);
+  }
+
+  inspectExpression(select.where, scopeSources, context);
+  inspectExpression(select.groupby?.columns, scopeSources, context);
+  inspectExpression(select.having, scopeSources, context);
+  inspectExpression(select.orderby, scopeSources, context);
+  inspectExpression(select.window, scopeSources, context);
+  inspectExpression(select._orderby, scopeSources, context);
+
+  if (select._next) {
+    validateSelectStatement(select._next, context, cteNames);
+  }
 }
 
-function extractCteNames(sql: string): Set<string> {
-  const names = new Set<string>();
-  const cteRegex = /([a-zA-Z_][\w]*)\s+as\s*\(/gi;
-  for (const match of sql.matchAll(cteRegex)) {
-    names.add(match[1]);
+function buildScopeSources(
+  select: Select,
+  context: ValidationContext,
+  cteNames: Set<string>
+): ScopeSources {
+  const aliasToSource = new Map<string, string>();
+  const curatedSources = new Set<string>();
+  const cteSources = new Set<string>(cteNames);
+
+  const fromItems = Array.isArray(select.from) ? select.from : [];
+  for (const item of fromItems) {
+    if ("expr" in item && item.expr?.ast) {
+      validateSelectStatement(item.expr.ast, context, cteNames);
+      if (item.as) {
+        aliasToSource.set(item.as, item.as);
+        cteSources.add(item.as);
+      }
+      continue;
+    }
+
+    if (!("table" in item) || !item.table) {
+      continue;
+    }
+
+    const sourceName = item.table;
+    const alias = item.as ?? sourceName;
+    aliasToSource.set(alias, sourceName);
+    aliasToSource.set(sourceName, sourceName);
+
+    if (cteNames.has(sourceName)) {
+      cteSources.add(sourceName);
+      continue;
+    }
+
+    if (!(sourceName in context.semanticCatalog)) {
+      throw new Error(
+        `Query references non-curated source ${sourceName}. Only curated semantic-layer views are allowed.`
+      );
+    }
+
+    curatedSources.add(sourceName);
+    context.sourceNames.add(sourceName);
   }
-  return names;
+
+  return { aliasToSource, curatedSources, cteSources };
+}
+
+type ScopeSources = {
+  aliasToSource: Map<string, string>;
+  curatedSources: Set<string>;
+  cteSources: Set<string>;
+};
+
+function inspectExpression(
+  value: unknown,
+  scopeSources: ScopeSources,
+  context: ValidationContext
+): void {
+  if (value === null || value === undefined) {
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      inspectExpression(item, scopeSources, context);
+    }
+    return;
+  }
+
+  if (typeof value !== "object") {
+    return;
+  }
+
+  const node = value as Record<string, unknown>;
+  if (node.type === "column_ref") {
+    validateColumnReference(node, scopeSources, context);
+    return;
+  }
+
+  for (const [key, nested] of Object.entries(node)) {
+    if (
+      key === "loc" ||
+      key === "tableList" ||
+      key === "columnList" ||
+      key === "type"
+    ) {
+      continue;
+    }
+    inspectExpression(nested, scopeSources, context);
+  }
+}
+
+function validateColumnReference(
+  node: Record<string, unknown>,
+  scopeSources: ScopeSources,
+  context: ValidationContext
+): void {
+  const tableName =
+    typeof node.table === "string" && node.table.trim() ? node.table : null;
+  const columnName = extractColumnName(node.column);
+
+  if (!columnName || columnName === "*") {
+    throw new Error(
+      "SELECT * is not allowed. Queries must project explicit columns."
+    );
+  }
+
+  let resolvedSource: string | null = null;
+  if (tableName) {
+    resolvedSource = scopeSources.aliasToSource.get(tableName) ?? tableName;
+  } else if (scopeSources.curatedSources.size === 1 && scopeSources.cteSources.size === 0) {
+    resolvedSource = Array.from(scopeSources.curatedSources)[0];
+  } else {
+    const matchingSources = Array.from(scopeSources.curatedSources).filter((sourceName) =>
+      context.semanticCatalog[sourceName].columns.includes(columnName)
+    );
+    if (matchingSources.length === 1) {
+      resolvedSource = matchingSources[0];
+    }
+  }
+
+  if (resolvedSource && scopeSources.cteSources.has(resolvedSource)) {
+    return;
+  }
+
+  if (resolvedSource) {
+    const source = context.semanticCatalog[resolvedSource];
+    if (!source) {
+      throw new Error(
+        `Query references non-curated source ${resolvedSource}. Only curated semantic-layer views are allowed.`
+      );
+    }
+
+    if (!source.columns.includes(columnName)) {
+      throw new Error(
+        `Column ${columnName} is not available on curated source ${resolvedSource}.`
+      );
+    }
+  } else if (scopeSources.cteSources.size === 0) {
+    throw new Error(
+      `Column ${columnName} could not be resolved against the curated semantic layer.`
+    );
+  }
+
+  if (RESTRICTED_COLUMN_NAMES.has(columnName)) {
+    context.restrictedColumns.add(columnName);
+  }
+}
+
+function extractColumnName(column: unknown): string | null {
+  if (typeof column === "string") {
+    return column;
+  }
+
+  if (
+    column &&
+    typeof column === "object" &&
+    "expr" in column &&
+    column.expr &&
+    typeof column.expr === "object" &&
+    "value" in column.expr &&
+    typeof column.expr.value === "string"
+  ) {
+    return column.expr.value;
+  }
+
+  return null;
+}
+
+function isSelectStar(expression: unknown): boolean {
+  if (!expression || typeof expression !== "object") {
+    return false;
+  }
+
+  const node = expression as Record<string, unknown>;
+  if (node.type === "star") {
+    return true;
+  }
+
+  return node.type === "column_ref" && extractColumnName(node.column) === "*";
+}
+
+function extractLimitValue(select: Select): number | null {
+  const limits = select.limit?.value;
+  if (!limits || limits.length === 0) {
+    return select._next ? extractLimitValue(select._next) : null;
+  }
+
+  const candidate = limits[0];
+  if (!candidate || typeof candidate.value !== "number") {
+    return null;
+  }
+
+  return candidate.value;
 }
 
 function extractSqlLimit(sql: string): number | null {
