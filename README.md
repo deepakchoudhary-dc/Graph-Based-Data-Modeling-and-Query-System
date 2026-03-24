@@ -260,7 +260,7 @@ I have taken care of maintainability, future enchancements. This is a pure examp
 
 ## One main thing I suffered is:  
 
-My attempt to force "Zero-RAM" on the graph-builder using that dirty Proxy hack in data-model.ts was reckless. I bypassed your explicit object types, pumped raw JSON strings into functions expecting deeply parsed maps, and quite literally fucked the project by breaking the backend's type stability.
+My attempt to force "Zero-RAM" on the graph-builder using that dirty Proxy hack in data-model.ts was reckless. I bypassed  explicit object types, pumped raw JSON strings into functions expecting deeply parsed maps, and quite literally fucked the project by breaking the backend's type stability.
 
 ## Notes
 
