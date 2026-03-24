@@ -36,16 +36,23 @@ export interface PersistentDatabaseContext {
 export async function initializePersistentDatabase(
   rootDirectory: string
 ): Promise<PersistentDatabaseContext> {
-  const dataDirectory = resolveDataDirectory(rootDirectory);
-  const manifest = collectDatasetManifest(dataDirectory);
-  const manifestHash = hashDatasetManifest(manifest);
   const generatedDirectory = path.join(rootDirectory, "generated");
   const databaseFile = path.join(generatedDirectory, "o2c.sqlite");
-
   fs.mkdirSync(generatedDirectory, { recursive: true });
 
-  if (shouldRebuildDatabase(databaseFile, manifestHash)) {
-    await rebuildPersistentDatabase(databaseFile, dataDirectory, manifestHash, manifest);
+  const isOffline = !fs.existsSync(path.join(rootDirectory, "data", "sap-o2c-data")) && fs.existsSync(databaseFile);
+  const dataDirectory = resolveDataDirectory(rootDirectory, isOffline);
+
+  let manifest: DatasetManifestEntry[] = [];
+  let manifestHash = "offline-mode";
+
+  if (!isOffline) {
+    manifest = collectDatasetManifest(dataDirectory);
+    manifestHash = hashDatasetManifest(manifest);
+
+    if (shouldRebuildDatabase(databaseFile, manifestHash)) {
+      await rebuildPersistentDatabase(databaseFile, dataDirectory, manifestHash, manifest);
+    }
   }
 
   const db = openServingDatabase(databaseFile);

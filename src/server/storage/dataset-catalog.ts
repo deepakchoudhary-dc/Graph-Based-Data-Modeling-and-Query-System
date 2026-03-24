@@ -34,15 +34,23 @@ export const DATASET_NAMES = [
   "sales_order_schedule_lines"
 ] as const;
 
-export function resolveDataDirectory(rootDirectory: string): string {
+export function resolveDataDirectory(rootDirectory: string, allowMissing = false): string {
   const extractedPath = path.join(rootDirectory, "data", "sap-o2c-data");
-  if (!fs.existsSync(extractedPath)) {
+  if (!fs.existsSync(extractedPath) && !allowMissing) {
     throw new Error(
       `Dataset directory not found at ${extractedPath}. Extract sap-order-to-cash-dataset.zip first.`
     );
   }
 
   return extractedPath;
+}
+
+export function loadRawDatasetsFromDb(db: import("./semantic-layer.js").SqliteDatabase): RawDatasets {
+  const datasets: RawDatasets = {};
+  for (const name of DATASET_NAMES) {
+    datasets[name] = db.prepare(`SELECT * FROM "${name}"`).all() as Row[];
+  }
+  return datasets;
 }
 
 export function loadRawDatasets(dataDirectory: string): RawDatasets {

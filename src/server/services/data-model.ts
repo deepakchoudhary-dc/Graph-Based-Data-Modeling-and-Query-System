@@ -105,9 +105,9 @@ const EXAMPLE_PROMPTS = [
 
 export async function buildDataModel(rootDirectory: string): Promise<DataModel> {
   const persistent = await initializePersistentDatabase(rootDirectory);
-  const { loadRawDatasets } = await import('../storage/dataset-catalog.js');
-  const raw = loadRawDatasets(persistent.dataDirectory);
+  const { loadRawDatasetsFromDb } = await import('../storage/dataset-catalog.js');
   const db = persistent.db;
+  const raw = loadRawDatasetsFromDb(db);
   const graphContext = buildGraph(raw);
   const analytics = buildAnalyticsSummary(db, graphContext.lookup);
 
