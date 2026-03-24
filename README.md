@@ -268,4 +268,4 @@ My attempt to force "Zero-RAM" on the graph-builder using that dirty Proxy hack 
 - The app runs directly against the provided extracted data
 - Gemini is the default provider because it has a usable free tier and works well for structured planning tasks
 
-If you find this project, Please write to me at: dchoudhary2004@gmail.com
+If you find this project interesting and want to suggest some cool project or ideas, Please write to me at: dchoudhary2004@gmail.com
